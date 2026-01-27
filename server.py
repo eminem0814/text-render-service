@@ -1301,10 +1301,240 @@ def extract_style():
         return jsonify({"error": str(e)}), 500
 
 
+# ===== Gemini 배치 결과 처리 (v5) =====
+
+@app.route("/process-batch-results", methods=["POST"])
+def process_batch_results():
+    """
+    Gemini 배치 API 결과 파일을 처리하여 이미지 병합 및 업로드
+
+    n8n 클라우드의 메모리 제한을 피하기 위해 이 서비스에서 직접 처리
+
+    Request:
+        gemini_file_name: Gemini 결과 파일명 (예: "files/batch-xxx")
+        gemini_api_key: Gemini API 키
+        chunk_metadata: 청크 메타데이터 리스트 [{key, productId, imageIndex, chunkIndex, ...}, ...]
+        product_map: 상품별 정보 {productId: {productCode, imageCount}, ...}
+        config: 설정 {supabaseUrl, supabaseKey, storageBucket, tableName, targetLangCode}
+
+    Response:
+        success: 성공 여부
+        processed_images: 처리된 이미지 리스트
+        uploaded_urls: 업로드된 URL 리스트
+    """
+    try:
+        data = request.get_json()
+
+        gemini_file_name = data.get("gemini_file_name")
+        gemini_api_key = data.get("gemini_api_key")
+        chunk_metadata = data.get("chunk_metadata", [])
+        product_map = data.get("product_map", {})
+        config = data.get("config", {})
+
+        if not gemini_file_name or not gemini_api_key:
+            return jsonify({"error": "gemini_file_name and gemini_api_key required"}), 400
+
+        logger.info(f"Processing batch results: {gemini_file_name}")
+        logger.info(f"Chunk metadata count: {len(chunk_metadata)}")
+
+        # 1. Gemini 결과 파일 다운로드
+        download_url = f"https://generativelanguage.googleapis.com/download/v1beta/{gemini_file_name}:download?alt=media"
+
+        logger.info(f"Downloading from: {download_url}")
+
+        download_response = requests.get(
+            download_url,
+            headers={"x-goog-api-key": gemini_api_key},
+            timeout=300
+        )
+
+        if download_response.status_code != 200:
+            return jsonify({
+                "error": f"Failed to download results file: {download_response.status_code}",
+                "details": download_response.text[:500]
+            }), 400
+
+        jsonl_content = download_response.text
+        logger.info(f"Downloaded {len(jsonl_content)} bytes")
+
+        # 2. JSONL 파싱 및 이미지별 그룹핑
+        lines = jsonl_content.strip().split('\n')
+        logger.info(f"Parsing {len(lines)} JSONL lines")
+
+        # custom_id로 청크 메타데이터 인덱싱
+        meta_by_key = {m["key"]: m for m in chunk_metadata}
+
+        # 이미지별로 청크 그룹핑
+        # 키: "productId_imageIndex"
+        image_chunks = {}
+
+        for line_num, line in enumerate(lines):
+            if not line.strip():
+                continue
+
+            try:
+                response_data = json.loads(line)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Line {line_num}: JSON parse error - {e}")
+                continue
+
+            custom_id = response_data.get("custom_id") or response_data.get("customId")
+            if not custom_id:
+                logger.warning(f"Line {line_num}: No custom_id")
+                continue
+
+            meta = meta_by_key.get(custom_id)
+            if not meta:
+                logger.warning(f"Line {line_num}: No metadata for {custom_id}")
+                continue
+
+            # 이미지 데이터 추출
+            translated_base64 = None
+            candidates = response_data.get("response", {}).get("candidates", [])
+
+            if candidates and candidates[0].get("content", {}).get("parts"):
+                for part in candidates[0]["content"]["parts"]:
+                    inline_data = part.get("inline_data") or part.get("inlineData")
+                    if inline_data and inline_data.get("data") and len(inline_data["data"]) > 1000:
+                        translated_base64 = inline_data["data"]
+                        break
+
+            if not translated_base64:
+                logger.warning(f"Line {line_num}: No image data for {custom_id}")
+                continue
+
+            image_key = f"{meta['productId']}_{meta['imageIndex']}"
+
+            if image_key not in image_chunks:
+                image_chunks[image_key] = {
+                    "productId": meta["productId"],
+                    "productCode": meta.get("productCode"),
+                    "imageIndex": meta["imageIndex"],
+                    "totalChunks": meta.get("totalChunks", 1),
+                    "chunks": []
+                }
+
+            image_chunks[image_key]["chunks"].append({
+                "index": meta["chunkIndex"],
+                "base64": translated_base64,
+                "height": meta.get("chunkHeight", 2000)
+            })
+
+        logger.info(f"Grouped into {len(image_chunks)} images")
+
+        # 3. 각 이미지 병합 및 업로드
+        results = []
+        supabase_url = config.get("supabaseUrl")
+        supabase_key = config.get("supabaseKey")
+        storage_bucket = config.get("storageBucket", "translated-images")
+        table_name = config.get("tableName", "")
+        target_lang_code = config.get("targetLangCode", "en")
+
+        for image_key, image_data in image_chunks.items():
+            try:
+                # 청크 정렬
+                sorted_chunks = sorted(image_data["chunks"], key=lambda x: x["index"])
+
+                logger.info(f"Processing image {image_key}: {len(sorted_chunks)}/{image_data['totalChunks']} chunks")
+
+                if len(sorted_chunks) != image_data["totalChunks"]:
+                    logger.warning(f"Image {image_key}: Missing chunks ({len(sorted_chunks)}/{image_data['totalChunks']})")
+
+                # 청크가 1개면 병합 불필요
+                if len(sorted_chunks) == 1:
+                    merged_base64 = sorted_chunks[0]["base64"]
+                else:
+                    # 청크 병합
+                    merged_image = merge_images(sorted_chunks, overlap=0, blend_height=50)
+                    merged_base64, _ = image_to_base64(merged_image, format="JPEG", quality=95)
+
+                # Supabase Storage 업로드
+                if supabase_url and supabase_key:
+                    image_num = str(image_data["imageIndex"] + 1).zfill(2)
+                    file_name = f"{table_name}/{target_lang_code}/{table_name}_ID{image_data['productId']}_{image_num}_{target_lang_code}.jpg"
+
+                    upload_url = f"{supabase_url}/storage/v1/object/{storage_bucket}/{file_name}"
+
+                    upload_response = requests.post(
+                        upload_url,
+                        headers={
+                            "Authorization": f"Bearer {supabase_key}",
+                            "Content-Type": "image/jpeg",
+                            "x-upsert": "true"
+                        },
+                        data=base64.b64decode(merged_base64),
+                        timeout=120
+                    )
+
+                    if upload_response.status_code in [200, 201]:
+                        public_url = f"{supabase_url}/storage/v1/object/public/{storage_bucket}/{file_name}"
+                        logger.info(f"Uploaded: {file_name}")
+                    else:
+                        public_url = None
+                        logger.error(f"Upload failed for {file_name}: {upload_response.status_code}")
+                else:
+                    public_url = None
+
+                results.append({
+                    "productId": image_data["productId"],
+                    "productCode": image_data["productCode"],
+                    "imageIndex": image_data["imageIndex"],
+                    "chunksProcessed": len(sorted_chunks),
+                    "totalChunks": image_data["totalChunks"],
+                    "uploadedUrl": public_url,
+                    "success": public_url is not None
+                })
+
+            except Exception as img_err:
+                logger.error(f"Error processing image {image_key}: {img_err}")
+                import traceback
+                traceback.print_exc()
+                results.append({
+                    "productId": image_data["productId"],
+                    "imageIndex": image_data["imageIndex"],
+                    "error": str(img_err),
+                    "success": False
+                })
+
+        # 4. 상품별 URL 정리
+        product_urls = {}
+        for result in results:
+            if result.get("success") and result.get("uploadedUrl"):
+                pid = str(result["productId"])
+                if pid not in product_urls:
+                    product_urls[pid] = []
+                product_urls[pid].append({
+                    "index": result["imageIndex"],
+                    "url": result["uploadedUrl"]
+                })
+
+        # 인덱스 순 정렬
+        for pid in product_urls:
+            product_urls[pid] = sorted(product_urls[pid], key=lambda x: x["index"])
+
+        success_count = sum(1 for r in results if r.get("success"))
+
+        return jsonify({
+            "success": True,
+            "totalImages": len(image_chunks),
+            "processedImages": len(results),
+            "successCount": success_count,
+            "failCount": len(results) - success_count,
+            "results": results,
+            "productUrls": product_urls
+        })
+
+    except Exception as e:
+        logger.error(f"Error in process_batch_results: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
-    logger.info(f"Starting Text Render Service v4 on port {port}")
-    logger.info(f"Features: inpainting, text-render, slice, merge")
+    logger.info(f"Starting Text Render Service v5 on port {port}")
+    logger.info(f"Features: inpainting, text-render, slice, merge, batch-results")
     logger.info(f"OpenCV inpainting: enabled")
     logger.info(f"Vertex AI available: {vertex_ai_available}")
     app.run(host="0.0.0.0", port=port, debug=True)
