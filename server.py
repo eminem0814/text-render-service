@@ -1469,12 +1469,15 @@ def process_batch_results():
 
                     if upload_response.status_code in [200, 201]:
                         public_url = f"{supabase_url}/storage/v1/object/public/{storage_bucket}/{file_name}"
+                        upload_error = None
                         logger.info(f"Uploaded: {file_name}")
                     else:
                         public_url = None
-                        logger.error(f"Upload failed for {file_name}: {upload_response.status_code}")
+                        upload_error = f"HTTP {upload_response.status_code}: {upload_response.text[:200]}"
+                        logger.error(f"Upload failed for {file_name}: {upload_error}")
                 else:
                     public_url = None
+                    upload_error = "No Supabase credentials provided"
 
                 results.append({
                     "productId": image_data["productId"],
@@ -1483,7 +1486,8 @@ def process_batch_results():
                     "chunksProcessed": len(sorted_chunks),
                     "totalChunks": image_data["totalChunks"],
                     "uploadedUrl": public_url,
-                    "success": public_url is not None
+                    "success": public_url is not None,
+                    "uploadError": upload_error
                 })
 
             except Exception as img_err:
