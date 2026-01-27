@@ -37,6 +37,10 @@ CREDENTIALS_PATH = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
 PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
 LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
 
+# Supabase 설정 (환경변수에서 가져옴 - 배치 처리용)
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+
 # 폰트 경로 설정
 FONT_PATHS = [
     "/System/Library/Fonts/Helvetica.ttc",
@@ -1425,11 +1429,16 @@ def process_batch_results():
 
         # 3. 각 이미지 병합 및 업로드
         results = []
-        supabase_url = config.get("supabaseUrl")
-        supabase_key = config.get("supabaseKey")
+        # config에서 가져오거나 환경변수 사용 (fallback)
+        supabase_url = config.get("supabaseUrl") or SUPABASE_URL
+        supabase_key = config.get("supabaseKey") or SUPABASE_SERVICE_KEY
         storage_bucket = config.get("storageBucket", "translated-images")
         table_name = config.get("tableName", "")
         target_lang_code = config.get("targetLangCode", "en")
+
+        logger.info(f"Supabase URL: {supabase_url}")
+        logger.info(f"Supabase Key present: {bool(supabase_key)}")
+        logger.info(f"Storage bucket: {storage_bucket}")
 
         for image_key, image_data in image_chunks.items():
             try:
