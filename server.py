@@ -1378,9 +1378,10 @@ def process_batch_results():
                 logger.warning(f"Line {line_num}: JSON parse error - {e}")
                 continue
 
-            custom_id = response_data.get("custom_id") or response_data.get("customId")
+            # Gemini Batch API uses "key" field (not "custom_id")
+            custom_id = response_data.get("key") or response_data.get("custom_id") or response_data.get("customId")
             if not custom_id:
-                logger.warning(f"Line {line_num}: No custom_id")
+                logger.warning(f"Line {line_num}: No key/custom_id found")
                 continue
 
             meta = meta_by_key.get(custom_id)
