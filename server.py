@@ -1545,10 +1545,181 @@ def process_batch_results():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/translate-chunks", methods=["POST"])
+def translate_chunks():
+    """
+    실시간 청크 번역 API - n8n 클라우드의 60초 타임아웃 우회용
+
+    Request:
+        chunks: 슬라이스된 청크 리스트 [{base64, height, y_start, y_end, index}, ...]
+        gemini_api_key: Gemini API 키
+        gemini_model: 사용할 모델 (기본: gemini-2.0-flash-exp)
+        prompt: 번역 프롬프트
+
+    Response:
+        success: 성공 여부
+        translated_chunks: 번역된 청크 리스트
+        success_count: 성공한 청크 수
+        fail_count: 실패한 청크 수
+    """
+    import time
+
+    try:
+        data = request.get_json()
+
+        chunks = data.get("chunks", [])
+        gemini_api_key = data.get("gemini_api_key")
+        gemini_model = data.get("gemini_model", "gemini-2.0-flash-exp")
+        prompt = data.get("prompt", "Translate the text in this image to English.")
+
+        if not chunks:
+            return jsonify({"error": "chunks required"}), 400
+        if not gemini_api_key:
+            return jsonify({"error": "gemini_api_key required"}), 400
+
+        logger.info(f"[translate-chunks] Starting: {len(chunks)} chunks, model: {gemini_model}")
+
+        # Exponential Backoff 설정
+        MAX_RETRIES = 5
+        BASE_DELAY = 1.0
+        MAX_DELAY = 60.0
+
+        translated_chunks = []
+        progress_log = []
+
+        for i, chunk in enumerate(chunks):
+            chunk_start = time.time()
+            chunk_base64 = chunk.get("base64", "")
+            chunk_height = chunk.get("height", 0)
+
+            progress_log.append(f"[번역 {i+1}/{len(chunks)}] 청크 높이: {chunk_height}px")
+
+            translated_base64 = chunk_base64  # 기본값: 원본
+            success = False
+            error_msg = ""
+            retries = 0
+
+            for attempt in range(MAX_RETRIES):
+                try:
+                    # Gemini API 요청
+                    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_api_key}"
+
+                    request_body = {
+                        "contents": [{
+                            "parts": [
+                                {"text": prompt},
+                                {"inline_data": {"mime_type": "image/jpeg", "data": chunk_base64}}
+                            ]
+                        }],
+                        "generationConfig": {
+                            "responseModalities": ["TEXT", "IMAGE"]
+                        }
+                    }
+
+                    response = requests.post(
+                        api_url,
+                        json=request_body,
+                        headers={"Content-Type": "application/json"},
+                        timeout=180
+                    )
+
+                    if response.status_code == 429 or response.status_code >= 500:
+                        # Rate limit 또는 서버 에러 - 재시도
+                        retries = attempt + 1
+                        delay = min(BASE_DELAY * (2 ** attempt) + (time.time() % 1), MAX_DELAY)
+                        progress_log.append(f"  -> {response.status_code} 발생, {delay:.1f}초 후 재시도")
+                        time.sleep(delay)
+                        continue
+
+                    response.raise_for_status()
+                    result = response.json()
+
+                    # 응답에서 이미지 추출
+                    candidates = result.get("candidates", [])
+                    if candidates and candidates[0].get("content", {}).get("parts"):
+                        for part in candidates[0]["content"]["parts"]:
+                            inline_data = part.get("inline_data") or part.get("inlineData")
+                            if inline_data and inline_data.get("data") and len(inline_data["data"]) > 1000:
+                                translated_base64 = inline_data["data"]
+                                success = True
+                                break
+
+                    if success:
+                        break
+
+                    # 이미지 없이 응답 완료 - 재시도 불필요
+                    if candidates:
+                        finish_reason = candidates[0].get("finishReason", "")
+                        if finish_reason == "SAFETY":
+                            error_msg = "안전 필터 차단"
+                            break
+                        error_msg = f"이미지 응답 없음 (finishReason: {finish_reason})"
+                    else:
+                        error_msg = "응답에 candidates 없음"
+                    break
+
+                except requests.exceptions.Timeout:
+                    error_msg = "API 타임아웃"
+                    retries = attempt + 1
+                    if attempt < MAX_RETRIES - 1:
+                        delay = min(BASE_DELAY * (2 ** attempt), MAX_DELAY)
+                        time.sleep(delay)
+
+                except Exception as e:
+                    error_msg = str(e)
+                    retries = attempt + 1
+
+                    # 429 또는 5xx 에러인 경우 재시도
+                    if "429" in error_msg or "500" in error_msg or "503" in error_msg:
+                        if attempt < MAX_RETRIES - 1:
+                            delay = min(BASE_DELAY * (2 ** attempt), MAX_DELAY)
+                            time.sleep(delay)
+                            continue
+                    break
+
+            elapsed = time.time() - chunk_start
+
+            if success:
+                progress_log.append(f"  -> ✓ 성공 ({elapsed:.1f}초{f', 재시도: {retries}' if retries > 0 else ''})")
+            else:
+                progress_log.append(f"  -> ✗ 실패: {error_msg} ({elapsed:.1f}초)")
+
+            translated_chunks.append({
+                "index": chunk.get("index", i),
+                "base64": translated_base64,
+                "height": chunk_height,
+                "y_start": chunk.get("y_start", 0),
+                "y_end": chunk.get("y_end", 0),
+                "success": success,
+                "retries": retries,
+                "error": None if success else error_msg
+            })
+
+        success_count = sum(1 for c in translated_chunks if c["success"])
+        fail_count = len(translated_chunks) - success_count
+
+        logger.info(f"[translate-chunks] 완료: {success_count}/{len(chunks)} 성공")
+
+        return jsonify({
+            "success": True,
+            "translated_chunks": translated_chunks,
+            "total_chunks": len(chunks),
+            "success_count": success_count,
+            "fail_count": fail_count,
+            "progress_log": progress_log
+        })
+
+    except Exception as e:
+        logger.error(f"Error in translate_chunks: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
-    logger.info(f"Starting Text Render Service v5 on port {port}")
-    logger.info(f"Features: inpainting, text-render, slice, merge, batch-results")
+    logger.info(f"Starting Text Render Service v6 on port {port}")
+    logger.info(f"Features: inpainting, text-render, slice, merge, batch-results, translate-chunks")
     logger.info(f"OpenCV inpainting: enabled")
     logger.info(f"Vertex AI available: {vertex_ai_available}")
     app.run(host="0.0.0.0", port=port, debug=True)
