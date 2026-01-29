@@ -1556,9 +1556,29 @@ def process_batch_results():
         table_name = config.get("tableName", "")
         target_lang_code = config.get("targetLangCode", "en")
 
+        # 출력 포맷 설정 (실시간 처리와 동일하게)
+        output_format = config.get("outputFormat", "WEBP").upper()
+        output_quality = int(config.get("outputQuality", 100))
+        output_extension = config.get("outputExtension", ".webp")
+
+        # 포맷 매핑 (JPG -> JPEG for PIL)
+        pil_format = output_format
+        if pil_format == "JPG":
+            pil_format = "JPEG"
+
+        # MIME 타입 매핑
+        mime_types = {
+            "WEBP": "image/webp",
+            "JPEG": "image/jpeg",
+            "JPG": "image/jpeg",
+            "PNG": "image/png"
+        }
+        mime_type = mime_types.get(output_format, "image/webp")
+
         logger.info(f"Supabase URL: {supabase_url}")
         logger.info(f"Supabase Key present: {bool(supabase_key)}")
         logger.info(f"Storage bucket: {storage_bucket}")
+        logger.info(f"Output format: {output_format} (PIL: {pil_format}), Quality: {output_quality}")
 
         for image_key, image_data in image_chunks.items():
             try:
@@ -1570,18 +1590,20 @@ def process_batch_results():
                 if len(sorted_chunks) != image_data["totalChunks"]:
                     logger.warning(f"Image {image_key}: Missing chunks ({len(sorted_chunks)}/{image_data['totalChunks']})")
 
-                # 청크가 1개면 병합 불필요
+                # 청크가 1개면 병합 불필요, 하지만 포맷 변환은 필요
                 if len(sorted_chunks) == 1:
-                    merged_base64 = sorted_chunks[0]["base64"]
+                    # 단일 청크도 출력 포맷에 맞게 변환
+                    chunk_image = base64_to_image(sorted_chunks[0]["base64"])
+                    merged_base64, _ = image_to_base64(chunk_image, format=pil_format, quality=output_quality)
                 else:
-                    # 청크 병합
+                    # 청크 병합 후 출력 포맷 적용
                     merged_image = merge_images(sorted_chunks, overlap=0, blend_height=50)
-                    merged_base64, _ = image_to_base64(merged_image, format="JPEG", quality=95)
+                    merged_base64, _ = image_to_base64(merged_image, format=pil_format, quality=output_quality)
 
                 # Supabase Storage 업로드
                 if supabase_url and supabase_key:
                     image_num = str(image_data["imageIndex"] + 1).zfill(2)
-                    file_name = f"{table_name}/{target_lang_code}/{table_name}_ID{image_data['productId']}_{image_num}_{target_lang_code}.jpg"
+                    file_name = f"{table_name}/{target_lang_code}/{table_name}_ID{image_data['productId']}_{image_num}_{target_lang_code}{output_extension}"
 
                     upload_url = f"{supabase_url}/storage/v1/object/{storage_bucket}/{file_name}"
 
@@ -1589,7 +1611,7 @@ def process_batch_results():
                         upload_url,
                         headers={
                             "Authorization": f"Bearer {supabase_key}",
-                            "Content-Type": "image/jpeg",
+                            "Content-Type": mime_type,
                             "x-upsert": "true"
                         },
                         data=base64.b64decode(merged_base64),
