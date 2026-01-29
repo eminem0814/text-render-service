@@ -647,7 +647,7 @@ def render_text_on_image(image, text_blocks, original_image=None):
 def health():
     return jsonify({
         "status": "ok",
-        "service": "text-render-service-v4",
+        "service": "text-render-service-v8",
         "vertex_ai_available": vertex_ai_available,
         "opencv_available": True,
         "project_id": PROJECT_ID,
