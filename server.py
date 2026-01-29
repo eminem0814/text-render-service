@@ -1869,15 +1869,14 @@ def prepare_batch():
     """
     대량 배치 처리를 위한 준비 엔드포인트
 
-    n8n Cloud의 60초 타임아웃을 우회하기 위해 모든 무거운 처리를 서버에서 수행
+    n8n Cloud의 메모리 제한을 우회하기 위해 Railway에서 직접 Supabase 조회
     메모리 효율을 위해 JSONL을 임시 파일에 스트리밍
 
     Request:
-        products: 상품 리스트 [{id, product_code, description_images, ...}, ...]
         config: 설정 {
             tableName, geminiApiKey, geminiModel, prompt, chunkHeight,
             supabaseUrl, supabaseKey, storageBucket, targetLangCode,
-            outputFormat, outputExtension, outputQuality
+            outputFormat, outputExtension, outputQuality, limit
         }
 
     Response:
@@ -1898,28 +1897,63 @@ def prepare_batch():
 
     try:
         data = request.get_json()
-
-        products = data.get("products", [])
         config = data.get("config", {})
 
-        if not products:
-            return jsonify({"error": "products required"}), 400
-
+        # 필수 설정 확인
         gemini_api_key = config.get("geminiApiKey")
         if not gemini_api_key:
             return jsonify({"error": "geminiApiKey required in config"}), 400
 
+        supabase_url = config.get("supabaseUrl")
+        supabase_key = config.get("supabaseKey")
+        table_name = config.get("tableName")
+
+        if not supabase_url or not supabase_key:
+            return jsonify({"error": "supabaseUrl and supabaseKey required in config"}), 400
+
+        if not table_name:
+            return jsonify({"error": "tableName required in config"}), 400
+
         gemini_model = config.get("geminiModel", "gemini-2.0-flash-exp")
         prompt = config.get("prompt", "Translate the text in this image.")
         chunk_height = config.get("chunkHeight", 3000)
-        table_name = config.get("tableName", "")
+        limit = config.get("limit", 1000)
         text_service_url = config.get("textServiceUrl", "https://text-render-service-production.up.railway.app")
 
         logger.info("=" * 60)
         logger.info(f"[prepare-batch] 시작")
-        logger.info(f"[prepare-batch] 총 상품 수: {len(products)}")
+        logger.info(f"[prepare-batch] 테이블: {table_name}")
         logger.info(f"[prepare-batch] 모델: {gemini_model}")
         logger.info(f"[prepare-batch] 청크 높이: {chunk_height}")
+        logger.info(f"[prepare-batch] 조회 제한: {limit}")
+
+        # 1. Supabase에서 직접 상품 조회
+        logger.info(f"[prepare-batch] Supabase에서 상품 조회 중...")
+        supabase_headers = {
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}",
+            "Content-Type": "application/json"
+        }
+
+        products_response = requests.get(
+            f"{supabase_url}/rest/v1/{table_name}",
+            headers=supabase_headers,
+            params={
+                "select": "id,product_code,description_images,translated_image",
+                "order": "id",
+                "limit": limit
+            },
+            timeout=60
+        )
+
+        if products_response.status_code >= 400:
+            return jsonify({
+                "error": f"Supabase 상품 조회 실패: HTTP {products_response.status_code}",
+                "details": products_response.text[:500]
+            }), 500
+
+        products = products_response.json()
+        logger.info(f"[prepare-batch] 총 상품 수: {len(products)}")
 
         # 1. 이미지 URL 수집 및 상품 맵 생성
         image_requests = []
