@@ -1920,12 +1920,24 @@ def prepare_batch():
         limit = config.get("limit", 1000)
         text_service_url = config.get("textServiceUrl", "https://text-render-service-production.up.railway.app")
 
+        # 쿼리 타입 및 ID 필터링 옵션
+        query_type = config.get("queryType", "limit")
+        id_list = config.get("idList", [])
+        id_start = config.get("idStart")
+        id_end = config.get("idEnd")
+
         logger.info("=" * 60)
         logger.info(f"[prepare-batch] 시작")
         logger.info(f"[prepare-batch] 테이블: {table_name}")
         logger.info(f"[prepare-batch] 모델: {gemini_model}")
         logger.info(f"[prepare-batch] 청크 높이: {chunk_height}")
-        logger.info(f"[prepare-batch] 조회 제한: {limit}")
+        logger.info(f"[prepare-batch] 쿼리 타입: {query_type}")
+        if query_type == "ids":
+            logger.info(f"[prepare-batch] ID 목록: {id_list}")
+        elif query_type == "range":
+            logger.info(f"[prepare-batch] ID 범위: {id_start} ~ {id_end}")
+        else:
+            logger.info(f"[prepare-batch] 조회 제한: {limit}")
 
         # 1. Supabase에서 직접 상품 조회
         logger.info(f"[prepare-batch] Supabase에서 상품 조회 중...")
@@ -1935,17 +1947,25 @@ def prepare_batch():
             "Content-Type": "application/json"
         }
 
-        # 번역이 필요한 상품만 조회 (translated_image가 null인 것)
+        # 쿼리 타입에 따른 URL 구성
+        base_url = f"{supabase_url}/rest/v1/{table_name}"
+        base_params = "select=id,product_code,description_images&description_images=not.is.null&order=id"
+
+        if query_type == "ids" and id_list:
+            id_filter = f"id=in.({','.join(map(str, id_list))})"
+            url = f"{base_url}?{base_params}&{id_filter}"
+            logger.info(f"[prepare-batch] ID 목록 필터: {id_filter}")
+        elif query_type == "range" and id_start is not None and id_end is not None:
+            id_filter = f"id=gte.{id_start}&id=lte.{id_end}"
+            url = f"{base_url}?{base_params}&{id_filter}"
+            logger.info(f"[prepare-batch] ID 범위 필터: {id_filter}")
+        else:
+            url = f"{base_url}?{base_params}&limit={limit}"
+            logger.info(f"[prepare-batch] 제한 필터: limit={limit}")
+
         products_response = requests.get(
-            f"{supabase_url}/rest/v1/{table_name}",
+            url,
             headers=supabase_headers,
-            params={
-                "select": "id,product_code,description_images",
-                "translated_image": "is.null",
-                "description_images": "not.is.null",
-                "order": "id",
-                "limit": limit
-            },
             timeout=60
         )
 
