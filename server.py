@@ -1536,6 +1536,7 @@ def process_batch_results():
                     "productCode": meta.get("productCode"),
                     "imageIndex": meta["imageIndex"],
                     "totalChunks": meta.get("totalChunks", 1),
+                    "originalWidth": meta.get("chunkWidth"),  # 원본 이미지 너비
                     "chunks": []
                 }
 
@@ -1590,14 +1591,21 @@ def process_batch_results():
                 if len(sorted_chunks) != image_data["totalChunks"]:
                     logger.warning(f"Image {image_key}: Missing chunks ({len(sorted_chunks)}/{image_data['totalChunks']})")
 
-                # 청크가 1개면 병합 불필요, 하지만 포맷 변환은 필요
+                # 원본 이미지 너비 가져오기
+                original_width = image_data.get("originalWidth")
+
+                # 청크가 1개면 병합 불필요, 하지만 포맷 변환 및 리사이즈 필요
                 if len(sorted_chunks) == 1:
-                    # 단일 청크도 출력 포맷에 맞게 변환
                     chunk_image = base64_to_image(sorted_chunks[0]["base64"])
+                    # 원본 너비로 리사이즈 (Gemini가 크기를 변경했을 경우)
+                    if original_width and chunk_image.size[0] != original_width:
+                        original_height = int(chunk_image.size[1] * original_width / chunk_image.size[0])
+                        chunk_image = chunk_image.resize((original_width, original_height), Image.Resampling.LANCZOS)
+                        logger.info(f"Resized single chunk to original width: {original_width}px")
                     merged_base64, _ = image_to_base64(chunk_image, format=pil_format, quality=output_quality)
                 else:
-                    # 청크 병합 후 출력 포맷 적용
-                    merged_image = merge_images(sorted_chunks, overlap=0, blend_height=50)
+                    # 청크 병합 후 출력 포맷 적용 (원본 너비로 리사이즈)
+                    merged_image = merge_images(sorted_chunks, overlap=0, blend_height=50, target_width=original_width)
                     merged_base64, _ = image_to_base64(merged_image, format=pil_format, quality=output_quality)
 
                 # Supabase Storage 업로드
@@ -2085,6 +2093,7 @@ def prepare_batch():
                         "chunkIndex": chunk_idx,
                         "totalChunks": len(chunks),
                         "chunkHeight": chunk["height"],
+                        "chunkWidth": img_width,  # 원본 이미지 너비 저장
                         "yStart": chunk["y_start"],
                         "yEnd": chunk["y_end"]
                     })
