@@ -1935,11 +1935,14 @@ def prepare_batch():
             "Content-Type": "application/json"
         }
 
+        # 번역이 필요한 상품만 조회 (translated_image가 null인 것)
         products_response = requests.get(
             f"{supabase_url}/rest/v1/{table_name}",
             headers=supabase_headers,
             params={
-                "select": "id,product_code,description_images,translated_image",
+                "select": "id,product_code,description_images",
+                "translated_image": "is.null",
+                "description_images": "not.is.null",
                 "order": "id",
                 "limit": limit
             },
@@ -1953,7 +1956,16 @@ def prepare_batch():
             }), 500
 
         products = products_response.json()
-        logger.info(f"[prepare-batch] 총 상품 수: {len(products)}")
+        logger.info(f"[prepare-batch] 번역 필요한 상품 수: {len(products)}")
+
+        if not products:
+            return jsonify({
+                "success": True,
+                "message": "번역이 필요한 상품이 없습니다",
+                "totalProducts": 0,
+                "totalImages": 0,
+                "totalChunks": 0
+            })
 
         # 1. 이미지 URL 수집 및 상품 맵 생성
         image_requests = []
