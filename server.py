@@ -1858,10 +1858,311 @@ def translate_chunks():
         return jsonify({"error": str(e)}), 500
 
 
+def base64_to_image(base64_string):
+    """Base64 문자열을 PIL Image로 변환"""
+    image_data = base64.b64decode(base64_string)
+    return Image.open(BytesIO(image_data)).convert("RGB")
+
+
+@app.route("/prepare-batch", methods=["POST"])
+def prepare_batch():
+    """
+    대량 배치 처리를 위한 준비 엔드포인트
+
+    n8n Cloud의 60초 타임아웃을 우회하기 위해 모든 무거운 처리를 서버에서 수행
+
+    Request:
+        products: 상품 리스트 [{id, product_code, description_images, ...}, ...]
+        config: 설정 {
+            tableName, geminiApiKey, geminiModel, prompt, chunkHeight,
+            supabaseUrl, supabaseKey, storageBucket, targetLangCode,
+            outputFormat, outputExtension, outputQuality
+        }
+
+    Response:
+        success: 성공 여부
+        batchName: Gemini 배치 작업명
+        batchState: 배치 상태
+        totalProducts: 총 상품 수
+        totalImages: 총 이미지 수
+        totalChunks: 총 청크 수
+        chunkMetadata: 청크 메타데이터
+        productMap: 상품 맵
+    """
+    import time
+
+    try:
+        data = request.get_json()
+
+        products = data.get("products", [])
+        config = data.get("config", {})
+
+        if not products:
+            return jsonify({"error": "products required"}), 400
+
+        gemini_api_key = config.get("geminiApiKey")
+        if not gemini_api_key:
+            return jsonify({"error": "geminiApiKey required in config"}), 400
+
+        gemini_model = config.get("geminiModel", "gemini-2.0-flash-exp")
+        prompt = config.get("prompt", "Translate the text in this image.")
+        chunk_height = config.get("chunkHeight", 3000)
+        table_name = config.get("tableName", "")
+        text_service_url = config.get("textServiceUrl", "https://text-render-service-production.up.railway.app")
+
+        logger.info("=" * 60)
+        logger.info(f"[prepare-batch] 시작")
+        logger.info(f"[prepare-batch] 총 상품 수: {len(products)}")
+        logger.info(f"[prepare-batch] 모델: {gemini_model}")
+        logger.info(f"[prepare-batch] 청크 높이: {chunk_height}")
+
+        # 1. 이미지 URL 수집 및 상품 맵 생성
+        image_requests = []
+        product_map = {}
+
+        for product in products:
+            product_id = product.get("id")
+            product_code = product.get("product_code", "")
+            desc_images = product.get("description_images", [])
+
+            # description_images가 문자열이면 JSON 파싱
+            if isinstance(desc_images, str):
+                try:
+                    desc_images = json.loads(desc_images)
+                except:
+                    desc_images = []
+
+            if not desc_images:
+                continue
+
+            product_map[str(product_id)] = {
+                "productCode": product_code,
+                "imageCount": len(desc_images)
+            }
+
+            for i, image_url in enumerate(desc_images):
+                if image_url and image_url.strip():
+                    image_requests.append({
+                        "productId": product_id,
+                        "productCode": product_code,
+                        "imageIndex": i,
+                        "imageUrl": image_url,
+                        "tableName": table_name
+                    })
+
+        logger.info(f"[prepare-batch] 총 이미지 수: {len(image_requests)}")
+
+        if not image_requests:
+            return jsonify({
+                "success": False,
+                "error": "처리할 이미지가 없습니다"
+            }), 400
+
+        # 2. 각 이미지 다운로드 및 청크 분할
+        jsonl_lines = []
+        chunk_metadata = []
+        total_chunks = 0
+        errors = []
+
+        for img_idx, img_req in enumerate(image_requests):
+            logger.info(f"[prepare-batch] 이미지 {img_idx + 1}/{len(image_requests)}: 상품 {img_req['productId']}")
+
+            try:
+                # 이미지 다운로드
+                start_time = time.time()
+                image_response = requests.get(
+                    img_req["imageUrl"],
+                    timeout=120
+                )
+                image_response.raise_for_status()
+
+                image = Image.open(BytesIO(image_response.content)).convert("RGB")
+                download_time = time.time() - start_time
+                logger.info(f"  -> 다운로드 완료 ({image.size[0]}x{image.size[1]}, {download_time:.1f}초)")
+
+                # 이미지 슬라이스
+                start_time = time.time()
+                chunks = slice_image(image, chunk_height=chunk_height, use_smart_cut=True, overlap=0)
+                slice_time = time.time() - start_time
+                logger.info(f"  -> {len(chunks)}개 청크 생성 ({slice_time:.1f}초)")
+
+                # 각 청크에 대한 배치 요청 생성
+                for chunk_idx, chunk in enumerate(chunks):
+                    request_key = f"p{img_req['productId']}_i{img_req['imageIndex']}_c{chunk_idx}"
+
+                    batch_request = {
+                        "key": request_key,
+                        "request": {
+                            "contents": [{
+                                "parts": [
+                                    {"text": prompt},
+                                    {"inline_data": {"mime_type": "image/jpeg", "data": chunk["base64"]}}
+                                ]
+                            }],
+                            "generation_config": {
+                                "response_modalities": ["TEXT", "IMAGE"]
+                            }
+                        }
+                    }
+
+                    jsonl_lines.append(json.dumps(batch_request))
+
+                    chunk_metadata.append({
+                        "key": request_key,
+                        "productId": img_req["productId"],
+                        "productCode": img_req["productCode"],
+                        "imageIndex": img_req["imageIndex"],
+                        "chunkIndex": chunk_idx,
+                        "totalChunks": len(chunks),
+                        "chunkHeight": chunk["height"],
+                        "yStart": chunk["y_start"],
+                        "yEnd": chunk["y_end"]
+                    })
+
+                    total_chunks += 1
+
+            except Exception as img_err:
+                error_msg = f"상품 {img_req['productId']} 이미지 {img_req['imageIndex']}: {str(img_err)}"
+                logger.error(f"  -> 에러: {error_msg}")
+                errors.append(error_msg)
+
+        if not jsonl_lines:
+            return jsonify({
+                "success": False,
+                "error": "처리된 청크가 없습니다",
+                "errors": errors
+            }), 400
+
+        logger.info("=" * 60)
+        logger.info(f"[prepare-batch] 청크 생성 완료")
+        logger.info(f"  - 처리된 이미지: {len(image_requests) - len(errors)}")
+        logger.info(f"  - 생성된 청크: {total_chunks}")
+        logger.info(f"  - 에러: {len(errors)}")
+
+        # 3. Gemini Files API에 JSONL 업로드
+        jsonl_content = '\n'.join(jsonl_lines)
+        logger.info(f"[prepare-batch] JSONL 크기: {len(jsonl_content)} bytes")
+
+        try:
+            upload_response = requests.post(
+                f'https://generativelanguage.googleapis.com/upload/v1beta/files?key={gemini_api_key}',
+                headers={
+                    'X-Goog-Upload-Command': 'upload, finalize',
+                    'Content-Type': 'application/octet-stream',
+                    'Content-Length': str(len(jsonl_content.encode('utf-8')))
+                },
+                data=jsonl_content.encode('utf-8'),
+                timeout=300
+            )
+
+            if upload_response.status_code >= 400:
+                return jsonify({
+                    "success": False,
+                    "error": f"Files API 업로드 실패: HTTP {upload_response.status_code}",
+                    "details": upload_response.text[:500]
+                }), 500
+
+            upload_result = upload_response.json()
+            file_name = upload_result.get("file", {}).get("name")
+
+            if not file_name:
+                return jsonify({
+                    "success": False,
+                    "error": "Files API 응답에 파일명 없음",
+                    "details": str(upload_result)[:500]
+                }), 500
+
+            logger.info(f"[prepare-batch] Files API 업로드 완료: {file_name}")
+
+        except Exception as upload_err:
+            return jsonify({
+                "success": False,
+                "error": f"Files API 업로드 에러: {str(upload_err)}"
+            }), 500
+
+        # 4. Gemini Batch API 제출
+        batch_display_name = f"batch-{table_name}-{int(time.time())}"
+
+        try:
+            batch_response = requests.post(
+                f'https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:batchGenerateContent',
+                headers={
+                    'Content-Type': 'application/json',
+                    'x-goog-api-key': gemini_api_key
+                },
+                json={
+                    "batch": {
+                        "display_name": batch_display_name,
+                        "input_config": {"file_name": file_name}
+                    }
+                },
+                timeout=120
+            )
+
+            if batch_response.status_code >= 400:
+                return jsonify({
+                    "success": False,
+                    "error": f"Batch API 제출 실패: HTTP {batch_response.status_code}",
+                    "details": batch_response.text[:500]
+                }), 500
+
+            batch_result = batch_response.json()
+            batch_name = batch_result.get("name", "")
+            batch_state = batch_result.get("metadata", {}).get("state") or batch_result.get("state", "JOB_STATE_PENDING")
+
+            logger.info(f"[prepare-batch] Batch API 제출 완료")
+            logger.info(f"  - 배치명: {batch_name}")
+            logger.info(f"  - 상태: {batch_state}")
+
+        except Exception as batch_err:
+            return jsonify({
+                "success": False,
+                "error": f"Batch API 제출 에러: {str(batch_err)}"
+            }), 500
+
+        # 5. 결과 반환
+        logger.info("=" * 60)
+
+        return jsonify({
+            "success": True,
+            "batchName": batch_name,
+            "batchState": batch_state,
+            "batchDisplayName": batch_display_name,
+            "fileName": file_name,
+            "totalProducts": len(product_map),
+            "totalImages": len(image_requests),
+            "totalChunks": total_chunks,
+            "chunkMetadata": chunk_metadata,
+            "productMap": product_map,
+            "config": {
+                "geminiApiKey": gemini_api_key,
+                "geminiModel": gemini_model,
+                "prompt": prompt,
+                "chunkHeight": chunk_height,
+                "supabaseUrl": config.get("supabaseUrl"),
+                "supabaseKey": config.get("supabaseKey"),
+                "storageBucket": config.get("storageBucket"),
+                "textServiceUrl": text_service_url,
+                "targetLangCode": config.get("targetLangCode", "en"),
+                "outputFormat": config.get("outputFormat", "WEBP"),
+                "outputExtension": config.get("outputExtension", ".webp"),
+                "outputQuality": config.get("outputQuality", 100)
+            },
+            "submittedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "errors": errors if errors else None
+        })
+
+    except Exception as e:
+        logger.error(f"Error in prepare_batch: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
-    logger.info(f"Starting Text Render Service v6 on port {port}")
-    logger.info(f"Features: inpainting, text-render, slice, merge, batch-results, translate-chunks")
+    logger.info(f"Starting Text Render Service v7 on port {port}")
+    logger.info(f"Features: inpainting, text-render, slice, merge, batch-results, translate-chunks, prepare-batch")
     logger.info(f"OpenCV inpainting: enabled")
     logger.info(f"Vertex AI available: {vertex_ai_available}")
     app.run(host="0.0.0.0", port=port, debug=True)
