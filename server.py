@@ -1695,7 +1695,7 @@ def translate_chunks():
     Request:
         chunks: 슬라이스된 청크 리스트 [{base64, height, y_start, y_end, index}, ...]
         gemini_api_key: Gemini API 키
-        gemini_model: 사용할 모델 (기본: gemini-2.0-flash-exp)
+        gemini_model: 사용할 모델 (기본: gemini-3-pro-image-preview)
         prompt: 번역 프롬프트
 
     Response:
@@ -1711,7 +1711,7 @@ def translate_chunks():
 
         chunks = data.get("chunks", [])
         gemini_api_key = data.get("gemini_api_key")
-        gemini_model = data.get("gemini_model", "gemini-2.0-flash-exp")
+        gemini_model = data.get("gemini_model", "gemini-3-pro-image-preview")
         prompt = data.get("prompt", "Translate the text in this image to English.")
 
         if not chunks:
@@ -1914,7 +1914,7 @@ def prepare_batch():
         if not table_name:
             return jsonify({"error": "tableName required in config"}), 400
 
-        gemini_model = config.get("geminiModel", "gemini-2.0-flash-exp")
+        gemini_model = config.get("geminiModel", "gemini-3-pro-image-preview")
         prompt = config.get("prompt", "Translate the text in this image.")
         chunk_height = config.get("chunkHeight", 3000)
         limit = config.get("limit", 1000)
