@@ -1870,6 +1870,7 @@ def prepare_batch():
     대량 배치 처리를 위한 준비 엔드포인트
 
     n8n Cloud의 60초 타임아웃을 우회하기 위해 모든 무거운 처리를 서버에서 수행
+    메모리 효율을 위해 JSONL을 임시 파일에 스트리밍
 
     Request:
         products: 상품 리스트 [{id, product_code, description_images, ...}, ...]
@@ -1890,6 +1891,10 @@ def prepare_batch():
         productMap: 상품 맵
     """
     import time
+    import tempfile
+    import gc
+
+    temp_file = None
 
     try:
         data = request.get_json()
@@ -1958,18 +1963,20 @@ def prepare_batch():
                 "error": "처리할 이미지가 없습니다"
             }), 400
 
-        # 2. 각 이미지 다운로드 및 청크 분할
-        jsonl_lines = []
+        # 2. 임시 파일에 JSONL 스트리밍 (메모리 효율)
+        temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False)
         chunk_metadata = []
         total_chunks = 0
         errors = []
+        processed_images = 0
 
         for img_idx, img_req in enumerate(image_requests):
-            logger.info(f"[prepare-batch] 이미지 {img_idx + 1}/{len(image_requests)}: 상품 {img_req['productId']}")
+            if img_idx % 50 == 0:
+                logger.info(f"[prepare-batch] 진행: {img_idx + 1}/{len(image_requests)} 이미지")
+                gc.collect()  # 주기적 가비지 컬렉션
 
             try:
                 # 이미지 다운로드
-                start_time = time.time()
                 image_response = requests.get(
                     img_req["imageUrl"],
                     timeout=120
@@ -1977,16 +1984,12 @@ def prepare_batch():
                 image_response.raise_for_status()
 
                 image = Image.open(BytesIO(image_response.content)).convert("RGB")
-                download_time = time.time() - start_time
-                logger.info(f"  -> 다운로드 완료 ({image.size[0]}x{image.size[1]}, {download_time:.1f}초)")
+                img_width, img_height = image.size
 
                 # 이미지 슬라이스
-                start_time = time.time()
                 chunks = slice_image(image, chunk_height=chunk_height, use_smart_cut=True, overlap=0)
-                slice_time = time.time() - start_time
-                logger.info(f"  -> {len(chunks)}개 청크 생성 ({slice_time:.1f}초)")
 
-                # 각 청크에 대한 배치 요청 생성
+                # 각 청크에 대한 배치 요청 생성 및 파일에 직접 쓰기
                 for chunk_idx, chunk in enumerate(chunks):
                     request_key = f"p{img_req['productId']}_i{img_req['imageIndex']}_c{chunk_idx}"
 
@@ -2005,7 +2008,8 @@ def prepare_batch():
                         }
                     }
 
-                    jsonl_lines.append(json.dumps(batch_request))
+                    # 파일에 직접 쓰기 (메모리 절약)
+                    temp_file.write(json.dumps(batch_request) + '\n')
 
                     chunk_metadata.append({
                         "key": request_key,
@@ -2021,12 +2025,20 @@ def prepare_batch():
 
                     total_chunks += 1
 
+                # 메모리 해제
+                del image
+                del chunks
+                processed_images += 1
+
             except Exception as img_err:
                 error_msg = f"상품 {img_req['productId']} 이미지 {img_req['imageIndex']}: {str(img_err)}"
-                logger.error(f"  -> 에러: {error_msg}")
+                logger.error(f"[prepare-batch] 에러: {error_msg}")
                 errors.append(error_msg)
 
-        if not jsonl_lines:
+        temp_file.close()
+
+        if total_chunks == 0:
+            os.unlink(temp_file.name)
             return jsonify({
                 "success": False,
                 "error": "처리된 청크가 없습니다",
@@ -2035,25 +2047,33 @@ def prepare_batch():
 
         logger.info("=" * 60)
         logger.info(f"[prepare-batch] 청크 생성 완료")
-        logger.info(f"  - 처리된 이미지: {len(image_requests) - len(errors)}")
+        logger.info(f"  - 처리된 이미지: {processed_images}")
         logger.info(f"  - 생성된 청크: {total_chunks}")
         logger.info(f"  - 에러: {len(errors)}")
 
-        # 3. Gemini Files API에 JSONL 업로드
-        jsonl_content = '\n'.join(jsonl_lines)
-        logger.info(f"[prepare-batch] JSONL 크기: {len(jsonl_content)} bytes")
+        # 3. Gemini Files API에 JSONL 업로드 (파일에서 직접 읽기)
+        file_size = os.path.getsize(temp_file.name)
+        logger.info(f"[prepare-batch] JSONL 파일 크기: {file_size} bytes")
 
         try:
+            # 파일에서 직접 읽어서 업로드 (메모리 절약)
+            with open(temp_file.name, 'rb') as f:
+                jsonl_bytes = f.read()
+
             upload_response = requests.post(
                 f'https://generativelanguage.googleapis.com/upload/v1beta/files?key={gemini_api_key}',
                 headers={
                     'X-Goog-Upload-Command': 'upload, finalize',
                     'Content-Type': 'application/octet-stream',
-                    'Content-Length': str(len(jsonl_content.encode('utf-8')))
+                    'Content-Length': str(len(jsonl_bytes))
                 },
-                data=jsonl_content.encode('utf-8'),
-                timeout=300
+                data=jsonl_bytes,
+                timeout=600
             )
+
+            # 임시 파일 삭제
+            os.unlink(temp_file.name)
+            temp_file = None
 
             if upload_response.status_code >= 400:
                 return jsonify({
@@ -2075,6 +2095,11 @@ def prepare_batch():
             logger.info(f"[prepare-batch] Files API 업로드 완료: {file_name}")
 
         except Exception as upload_err:
+            if temp_file:
+                try:
+                    os.unlink(temp_file.name)
+                except:
+                    pass
             return jsonify({
                 "success": False,
                 "error": f"Files API 업로드 에러: {str(upload_err)}"
@@ -2156,12 +2181,18 @@ def prepare_batch():
         logger.error(f"Error in prepare_batch: {e}")
         import traceback
         traceback.print_exc()
+        # 임시 파일 정리
+        if temp_file:
+            try:
+                os.unlink(temp_file.name)
+            except:
+                pass
         return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
-    logger.info(f"Starting Text Render Service v7 on port {port}")
+    logger.info(f"Starting Text Render Service v8 on port {port}")
     logger.info(f"Features: inpainting, text-render, slice, merge, batch-results, translate-chunks, prepare-batch")
     logger.info(f"OpenCV inpainting: enabled")
     logger.info(f"Vertex AI available: {vertex_ai_available}")
