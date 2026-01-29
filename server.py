@@ -1153,10 +1153,16 @@ def merge_images_endpoint():
         output_format: 출력 포맷 - JPEG, PNG, WEBP (기본 JPEG)
         quality: 이미지 품질 0-100 (기본 95)
 
+        # Supabase 직접 업로드 옵션 (n8n 메모리 문제 해결용)
+        upload_to_supabase: true면 직접 업로드하고 URL 반환
+        supabase_url: Supabase URL
+        supabase_key: Supabase API 키
+        storage_bucket: 스토리지 버킷명
+        file_name: 업로드할 파일 경로
+
     Response:
-        image_base64: 병합된 이미지
-        size: {width, height}
-        format: 출력 포맷
+        (upload_to_supabase=false): image_base64, size, format
+        (upload_to_supabase=true): uploaded_url, size, format
     """
     try:
         data = request.get_json()
@@ -1168,14 +1174,25 @@ def merge_images_endpoint():
         output_format = data.get("output_format", "JPEG").upper()  # JPEG, PNG, WEBP
         quality = data.get("quality", 95)  # 이미지 품질
 
+        # Supabase 직접 업로드 옵션
+        upload_to_supabase = data.get("upload_to_supabase", False)
+        supabase_url = data.get("supabase_url")
+        supabase_key = data.get("supabase_key")
+        storage_bucket = data.get("storage_bucket")
+        file_name = data.get("file_name")
+
         if not chunks:
             return jsonify({"error": "chunks required"}), 400
 
         # 지원 포맷 검증
-        if output_format not in ["JPEG", "PNG", "WEBP"]:
+        if output_format not in ["JPEG", "PNG", "WEBP", "JPG"]:
             output_format = "JPEG"
 
-        logger.info(f"Merging {len(chunks)} chunks, overlap={overlap}, target_width={target_width}, format={output_format}")
+        # JPG를 JPEG로 통일
+        if output_format == "JPG":
+            output_format = "JPEG"
+
+        logger.info(f"Merging {len(chunks)} chunks, overlap={overlap}, target_width={target_width}, format={output_format}, upload_to_supabase={upload_to_supabase}")
 
         # 병합 실행 (원본 크기로 강제 리사이즈)
         merged_image = merge_images(chunks, overlap, blend_height, target_width, target_heights)
@@ -1219,6 +1236,57 @@ def merge_images_endpoint():
 
             logger.info(f"Split into {len(split_images)} parts")
 
+            # 분할된 이미지도 Supabase 직접 업로드 지원
+            if upload_to_supabase and supabase_url and supabase_key and storage_bucket and file_name:
+                logger.info(f"Uploading {len(split_images)} split images to Supabase")
+
+                uploaded_urls = []
+                for img_part in split_images:
+                    # 파일명에 파트 번호 추가 (확장자 앞에)
+                    base_name = file_name.rsplit('.', 1)[0] if '.' in file_name else file_name
+                    ext = file_name.rsplit('.', 1)[1] if '.' in file_name else 'webp'
+                    part_file_name = f"{base_name}_{str(img_part['part']).zfill(2)}.{ext}"
+
+                    upload_url = f"{supabase_url}/storage/v1/object/{storage_bucket}/{part_file_name}"
+
+                    try:
+                        upload_response = requests.post(
+                            upload_url,
+                            headers={
+                                "Authorization": f"Bearer {supabase_key}",
+                                "Content-Type": "image/webp",
+                                "x-upsert": "true"
+                            },
+                            data=base64.b64decode(img_part["base64"]),
+                            timeout=120
+                        )
+
+                        if upload_response.status_code in [200, 201]:
+                            public_url = f"{supabase_url}/storage/v1/object/public/{storage_bucket}/{part_file_name}"
+                            uploaded_urls.append({
+                                "part": img_part["part"],
+                                "url": public_url,
+                                "height": img_part["height"]
+                            })
+                            logger.info(f"  Part {img_part['part']} uploaded: {public_url}")
+                        else:
+                            logger.error(f"  Part {img_part['part']} upload failed: {upload_response.status_code}")
+
+                    except Exception as part_err:
+                        logger.error(f"  Part {img_part['part']} upload error: {part_err}")
+
+                return jsonify({
+                    "success": True,
+                    "split": True,
+                    "uploaded": True,
+                    "uploaded_urls": uploaded_urls,
+                    "total_parts": len(split_images),
+                    "size": {"width": width, "height": height},
+                    "format": "WEBP",
+                    "mime_type": "image/webp",
+                    "extension": ".webp"
+                })
+
             return jsonify({
                 "success": True,
                 "split": True,
@@ -1241,6 +1309,58 @@ def merge_images_endpoint():
         }
         info = format_info.get(actual_format, format_info["JPEG"])
 
+        # Supabase 직접 업로드 모드
+        if upload_to_supabase and supabase_url and supabase_key and storage_bucket and file_name:
+            logger.info(f"Uploading directly to Supabase: {file_name}")
+
+            upload_url = f"{supabase_url}/storage/v1/object/{storage_bucket}/{file_name}"
+
+            try:
+                upload_response = requests.post(
+                    upload_url,
+                    headers={
+                        "Authorization": f"Bearer {supabase_key}",
+                        "Content-Type": info["mime_type"],
+                        "x-upsert": "true"
+                    },
+                    data=base64.b64decode(merged_base64),
+                    timeout=120
+                )
+
+                if upload_response.status_code in [200, 201]:
+                    public_url = f"{supabase_url}/storage/v1/object/public/{storage_bucket}/{file_name}"
+                    logger.info(f"Upload successful: {public_url}")
+
+                    return jsonify({
+                        "success": True,
+                        "split": False,
+                        "uploaded": True,
+                        "uploaded_url": public_url,
+                        "file_name": file_name,
+                        "size": {
+                            "width": merged_image.size[0],
+                            "height": merged_image.size[1]
+                        },
+                        "format": actual_format,
+                        "mime_type": info["mime_type"],
+                        "extension": info["extension"]
+                    })
+                else:
+                    logger.error(f"Upload failed: {upload_response.status_code} - {upload_response.text[:200]}")
+                    return jsonify({
+                        "success": False,
+                        "error": f"Upload failed: HTTP {upload_response.status_code}",
+                        "details": upload_response.text[:500]
+                    }), 500
+
+            except Exception as upload_err:
+                logger.error(f"Upload error: {upload_err}")
+                return jsonify({
+                    "success": False,
+                    "error": f"Upload error: {str(upload_err)}"
+                }), 500
+
+        # 기존 방식: base64 반환
         return jsonify({
             "success": True,
             "split": False,
