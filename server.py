@@ -106,6 +106,154 @@ def download_image(url):
     return Image.open(BytesIO(response.content)).convert("RGB")
 
 
+def validate_chunk(chunk_base64, expected_width=None, expected_height=None, tolerance=0.3):
+    """
+    청크 이미지 검증
+
+    Args:
+        chunk_base64: 검증할 이미지의 base64 문자열
+        expected_width: 예상 너비 (없으면 검증 스킵)
+        expected_height: 예상 높이 (없으면 검증 스킵)
+        tolerance: 허용 오차 비율 (기본 30%)
+
+    Returns:
+        dict: {
+            "valid": bool,
+            "reason": str (실패 사유),
+            "actual_width": int,
+            "actual_height": int
+        }
+    """
+    try:
+        # 1. Base64 디코딩 가능 여부
+        if not chunk_base64 or len(chunk_base64) < 1000:
+            return {"valid": False, "reason": "이미지 데이터 없음 또는 너무 작음", "actual_width": 0, "actual_height": 0}
+
+        # 2. 이미지 디코딩
+        try:
+            image_bytes = base64.b64decode(chunk_base64)
+            image = Image.open(BytesIO(image_bytes))
+            actual_width, actual_height = image.size
+        except Exception as e:
+            return {"valid": False, "reason": f"이미지 디코딩 실패: {str(e)}", "actual_width": 0, "actual_height": 0}
+
+        # 3. 너비 검증 (expected_width가 있을 경우)
+        if expected_width:
+            width_ratio = actual_width / expected_width
+            if width_ratio < (1 - tolerance) or width_ratio > (1 + tolerance):
+                return {
+                    "valid": False,
+                    "reason": f"너비 불일치: 예상 {expected_width}px, 실제 {actual_width}px ({width_ratio:.2f}배)",
+                    "actual_width": actual_width,
+                    "actual_height": actual_height
+                }
+
+        # 4. 높이 검증 (expected_height가 있을 경우)
+        if expected_height:
+            height_ratio = actual_height / expected_height
+            if height_ratio < (1 - tolerance) or height_ratio > (1 + tolerance):
+                return {
+                    "valid": False,
+                    "reason": f"높이 불일치: 예상 {expected_height}px, 실제 {actual_height}px ({height_ratio:.2f}배)",
+                    "actual_width": actual_width,
+                    "actual_height": actual_height
+                }
+
+        # 5. 최소 크기 검증
+        if actual_width < 50 or actual_height < 50:
+            return {
+                "valid": False,
+                "reason": f"이미지 크기 너무 작음: {actual_width}x{actual_height}",
+                "actual_width": actual_width,
+                "actual_height": actual_height
+            }
+
+        return {"valid": True, "reason": "검증 통과", "actual_width": actual_width, "actual_height": actual_height}
+
+    except Exception as e:
+        return {"valid": False, "reason": f"검증 중 오류: {str(e)}", "actual_width": 0, "actual_height": 0}
+
+
+def retry_chunk_realtime(chunk_base64, gemini_api_key, prompt, gemini_model="gemini-3-pro-image-preview", max_retries=2):
+    """
+    실시간 API로 청크 재처리
+
+    Args:
+        chunk_base64: 원본 청크 이미지 base64
+        gemini_api_key: Gemini API 키
+        prompt: 번역 프롬프트
+        gemini_model: 사용할 모델
+        max_retries: 최대 재시도 횟수
+
+    Returns:
+        dict: {
+            "success": bool,
+            "base64": str (번역된 이미지 또는 원본),
+            "error": str (에러 메시지)
+        }
+    """
+    import time
+
+    BASE_DELAY = 1.0
+    MAX_DELAY = 30.0
+
+    for attempt in range(max_retries):
+        try:
+            api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_api_key}"
+
+            request_body = {
+                "contents": [{
+                    "parts": [
+                        {"text": prompt},
+                        {"inline_data": {"mime_type": "image/jpeg", "data": chunk_base64}}
+                    ]
+                }],
+                "generationConfig": {
+                    "responseModalities": ["TEXT", "IMAGE"]
+                }
+            }
+
+            response = requests.post(
+                api_url,
+                json=request_body,
+                headers={"Content-Type": "application/json"},
+                timeout=180
+            )
+
+            if response.status_code == 429 or response.status_code >= 500:
+                delay = min(BASE_DELAY * (2 ** attempt), MAX_DELAY)
+                logger.warning(f"[retry_chunk] {response.status_code} 발생, {delay:.1f}초 후 재시도 ({attempt+1}/{max_retries})")
+                time.sleep(delay)
+                continue
+
+            response.raise_for_status()
+            result = response.json()
+
+            # 응답에서 이미지 추출
+            candidates = result.get("candidates", [])
+            if candidates and candidates[0].get("content", {}).get("parts"):
+                for part in candidates[0]["content"]["parts"]:
+                    inline_data = part.get("inline_data") or part.get("inlineData")
+                    if inline_data and inline_data.get("data") and len(inline_data["data"]) > 1000:
+                        return {"success": True, "base64": inline_data["data"], "error": None}
+
+            # 이미지 없이 응답
+            finish_reason = candidates[0].get("finishReason", "") if candidates else "NO_CANDIDATES"
+            return {"success": False, "base64": chunk_base64, "error": f"이미지 응답 없음 ({finish_reason})"}
+
+        except requests.exceptions.Timeout:
+            logger.warning(f"[retry_chunk] 타임아웃 ({attempt+1}/{max_retries})")
+            if attempt < max_retries - 1:
+                time.sleep(BASE_DELAY * (2 ** attempt))
+            continue
+
+        except Exception as e:
+            logger.error(f"[retry_chunk] 오류: {str(e)}")
+            return {"success": False, "base64": chunk_base64, "error": str(e)}
+
+    return {"success": False, "base64": chunk_base64, "error": f"{max_retries}회 재시도 실패"}
+
+
 def image_to_base64(image, format="JPEG", quality=95):
     """이미지를 Base64로 변환 (JPEG, PNG, WEBP 지원)
 
@@ -1492,6 +1640,14 @@ def process_batch_results():
         # 키: "productId_imageIndex"
         image_chunks = {}
 
+        # 검증 통계
+        validation_stats = {
+            "validation_passed": 0,
+            "validation_failed": 0,
+            "retry_success": 0,
+            "retry_failed": 0
+        }
+
         for line_num, line in enumerate(lines):
             if not line.strip():
                 continue
@@ -1528,6 +1684,57 @@ def process_batch_results():
                 logger.warning(f"Line {line_num}: No image data for {custom_id}")
                 continue
 
+            # ===== 청크 검증 및 자동 재시도 =====
+            expected_width = meta.get("chunkWidth")
+            expected_height = meta.get("chunkHeight")
+
+            validation = validate_chunk(
+                translated_base64,
+                expected_width=expected_width,
+                expected_height=expected_height,
+                tolerance=0.3  # 30% 오차 허용
+            )
+
+            if not validation["valid"]:
+                logger.warning(f"[검증 실패] {custom_id}: {validation['reason']}")
+
+                # 원본 청크로 재시도 (배치 요청에서 원본 가져올 수 없으므로 현재 결과 사용)
+                # 실시간 API로 재처리 시도
+                prompt = config.get("prompt", "Translate the text in this image to English.")
+                gemini_model = config.get("geminiModel", "gemini-3-pro-image-preview")
+
+                retry_result = retry_chunk_realtime(
+                    chunk_base64=translated_base64,  # 현재 결과로 재시도 (원본이 없으므로)
+                    gemini_api_key=gemini_api_key,
+                    prompt=prompt,
+                    gemini_model=gemini_model,
+                    max_retries=2
+                )
+
+                if retry_result["success"]:
+                    # 재시도 결과 검증
+                    retry_validation = validate_chunk(
+                        retry_result["base64"],
+                        expected_width=expected_width,
+                        expected_height=expected_height,
+                        tolerance=0.3
+                    )
+                    if retry_validation["valid"]:
+                        translated_base64 = retry_result["base64"]
+                        logger.info(f"[재시도 성공] {custom_id}: 검증 통과")
+                        validation_stats["retry_success"] = validation_stats.get("retry_success", 0) + 1
+                    else:
+                        logger.warning(f"[재시도 실패] {custom_id}: 재시도 후에도 검증 실패 - {retry_validation['reason']}")
+                        validation_stats["retry_failed"] = validation_stats.get("retry_failed", 0) + 1
+                else:
+                    logger.warning(f"[재시도 실패] {custom_id}: {retry_result['error']}")
+                    validation_stats["retry_failed"] = validation_stats.get("retry_failed", 0) + 1
+
+                validation_stats["validation_failed"] = validation_stats.get("validation_failed", 0) + 1
+            else:
+                validation_stats["validation_passed"] = validation_stats.get("validation_passed", 0) + 1
+            # ===== 검증 끝 =====
+
             image_key = f"{meta['productId']}_{meta['imageIndex']}"
 
             if image_key not in image_chunks:
@@ -1547,6 +1754,7 @@ def process_batch_results():
             })
 
         logger.info(f"Grouped into {len(image_chunks)} images")
+        logger.info(f"Validation stats: {validation_stats}")
 
         # 3. 각 이미지 병합 및 업로드
         results = []
@@ -1684,6 +1892,7 @@ def process_batch_results():
             "processedImages": len(results),
             "successCount": success_count,
             "failCount": len(results) - success_count,
+            "validationStats": validation_stats,
             "results": results,
             "productUrls": product_urls
         })
