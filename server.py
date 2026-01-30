@@ -128,7 +128,7 @@ def validate_translation_language(image_base64: str, target_lang: str, threshold
 
         # 2. OCR 실행 (PaddleOCR 3.x)
         reader = get_ocr_reader(target_lang)
-        results = reader.ocr(image_np, cls=True)
+        results = reader.ocr(image_np)
 
         # 3. 텍스트 없으면 통과 (예외 케이스)
         if results is None:
