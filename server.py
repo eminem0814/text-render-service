@@ -17,6 +17,11 @@ import base64
 import os
 import logging
 import json
+
+# PaddlePaddle PIR 비활성화 (호환성 문제 해결)
+os.environ['FLAGS_enable_pir_api'] = '0'
+os.environ['FLAGS_enable_pir_in_executor'] = '0'
+
 from paddleocr import PaddleOCR
 
 app = Flask(__name__)
