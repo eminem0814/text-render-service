@@ -159,8 +159,16 @@ def validate_translation_language(image_base64: str, target_lang: str, threshold
         # res.json['rec_texts'], res.json['rec_scores']
         try:
             for res in results:
-                rec_texts = res.json.get('rec_texts', [])
-                rec_scores = res.json.get('rec_scores', [])
+                # 디버깅: 결과 구조 로깅
+                logger.info(f"OCR result type: {type(res)}")
+                if hasattr(res, 'json'):
+                    logger.info(f"OCR res.json keys: {res.json.keys() if hasattr(res.json, 'keys') else type(res.json)}")
+                    logger.info(f"OCR res.json: {str(res.json)[:500]}")
+
+                rec_texts = res.json.get('rec_texts', []) if hasattr(res.json, 'get') else []
+                rec_scores = res.json.get('rec_scores', []) if hasattr(res.json, 'get') else []
+
+                logger.info(f"rec_texts count: {len(rec_texts)}, rec_scores count: {len(rec_scores)}")
 
                 for text, confidence in zip(rec_texts, rec_scores):
                     if confidence is None or confidence <= 0.3:
