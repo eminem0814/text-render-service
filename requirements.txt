@@ -8,4 +8,5 @@ google-cloud-aiplatform>=1.38.0
 google-auth>=2.23.0
 vertexai>=1.38.0
 gunicorn>=21.0.0
-easyocr>=1.7.0
+paddlepaddle>=2.5.0
+paddleocr>=2.7.0

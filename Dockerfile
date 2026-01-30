@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# 시스템 의존성 설치 (OpenCV, EasyOCR, 폰트 등)
+# 시스템 의존성 설치 (OpenCV, PaddleOCR, 폰트 등)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Python 의존성 설치 (EasyOCR은 PyTorch 포함)
+# Python 의존성 설치 (PaddleOCR - 경량화된 OCR)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt gunicorn
 
@@ -27,10 +27,8 @@ COPY server.py .
 ENV PORT=5001
 ENV WORKERS=2
 ENV PYTHONUNBUFFERED=1
-# EasyOCR 모델 캐시 디렉토리
-ENV EASYOCR_MODULE_PATH=/app/.EasyOCR
 
-# 헬스체크 (EasyOCR 초기화 시간 고려하여 start-period 증가)
+# 헬스체크 (PaddleOCR 초기화 시간 고려)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:${PORT}/health || exit 1
 

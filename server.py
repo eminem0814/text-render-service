@@ -17,7 +17,7 @@ import base64
 import os
 import logging
 import json
-import easyocr
+from paddleocr import PaddleOCR
 
 app = Flask(__name__)
 
@@ -29,30 +29,30 @@ CORS(app)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ===== OCR 설정 =====
-# EasyOCR 언어 코드 매핑 (시스템 언어코드 -> EasyOCR 언어코드)
+# ===== OCR 설정 (PaddleOCR) =====
+# PaddleOCR 언어 코드 매핑 (시스템 언어코드 -> PaddleOCR 언어코드)
 LANGUAGE_CODE_MAP = {
     # 동아시아
-    "ko": "ko",      # 한국어
-    "ja": "ja",      # 일본어
-    "zh": "ch_sim",  # 중국어 간체
-    "zh-CN": "ch_sim",
-    "zh-TW": "ch_tra",  # 중국어 번체
+    "ko": "korean",      # 한국어
+    "ja": "japan",       # 일본어
+    "zh": "ch",          # 중국어 간체
+    "zh-CN": "ch",
+    "zh-TW": "chinese_cht",  # 중국어 번체
     # 유럽
-    "en": "en",      # 영어
-    "de": "de",      # 독일어
-    "fr": "fr",      # 프랑스어
-    "es": "es",      # 스페인어
-    "it": "it",      # 이탈리아어
-    "pt": "pt",      # 포르투갈어
-    "ru": "ru",      # 러시아어
+    "en": "en",          # 영어
+    "de": "german",      # 독일어
+    "fr": "french",      # 프랑스어
+    "es": "es",          # 스페인어
+    "it": "it",          # 이탈리아어
+    "pt": "pt",          # 포르투갈어
+    "ru": "ru",          # 러시아어
     # 동남아
-    "th": "th",      # 태국어
-    "vi": "vi",      # 베트남어
-    "id": "id",      # 인도네시아어
+    "th": "th",          # 태국어
+    "vi": "vi",          # 베트남어
+    "id": "id",          # 인도네시아어
     # 기타
-    "ar": "ar",      # 아랍어
-    "hi": "hi",      # 힌디어
+    "ar": "ar",          # 아랍어
+    "hi": "hi",          # 힌디어
 }
 
 # OCR Reader 캐시 (언어별로 생성하여 재사용)
@@ -60,33 +60,33 @@ ocr_readers = {}
 
 def get_ocr_reader(target_lang: str):
     """
-    대상 언어에 맞는 OCR Reader를 반환 (캐싱)
+    대상 언어에 맞는 PaddleOCR Reader를 반환 (캐싱)
 
     Args:
         target_lang: 대상 언어 코드 (예: 'en', 'ja', 'zh')
 
     Returns:
-        EasyOCR Reader 객체
+        PaddleOCR 객체
     """
-    easyocr_lang = LANGUAGE_CODE_MAP.get(target_lang, "en")
+    paddle_lang = LANGUAGE_CODE_MAP.get(target_lang, "en")
 
-    if easyocr_lang not in ocr_readers:
+    if paddle_lang not in ocr_readers:
         try:
-            # GPU 사용 가능하면 GPU 사용, 아니면 CPU
-            ocr_readers[easyocr_lang] = easyocr.Reader(
-                [easyocr_lang],
-                gpu=False,  # Railway에서는 CPU만 사용
-                verbose=False
+            ocr_readers[paddle_lang] = PaddleOCR(
+                lang=paddle_lang,
+                use_angle_cls=True,
+                use_gpu=False,
+                show_log=False
             )
-            logger.info(f"OCR Reader 생성: {easyocr_lang}")
+            logger.info(f"PaddleOCR Reader 생성: {paddle_lang}")
         except Exception as e:
-            logger.error(f"OCR Reader 생성 실패: {e}")
+            logger.error(f"PaddleOCR Reader 생성 실패: {e}")
             # 실패시 영어 기본 리더 반환
             if "en" not in ocr_readers:
-                ocr_readers["en"] = easyocr.Reader(["en"], gpu=False, verbose=False)
+                ocr_readers["en"] = PaddleOCR(lang="en", use_angle_cls=True, use_gpu=False, show_log=False)
             return ocr_readers["en"]
 
-    return ocr_readers[easyocr_lang]
+    return ocr_readers[paddle_lang]
 
 
 def validate_translation_language(image_base64: str, target_lang: str, threshold: float = 0.2) -> dict:
@@ -118,16 +118,17 @@ def validate_translation_language(image_base64: str, target_lang: str, threshold
 
         # RGB 변환 (필요한 경우)
         if len(image_np.shape) == 2:  # 그레이스케일
-            pass  # EasyOCR은 그레이스케일도 처리 가능
+            pass  # PaddleOCR은 그레이스케일도 처리 가능
         elif image_np.shape[2] == 4:  # RGBA
             image_np = cv2.cvtColor(image_np, cv2.COLOR_RGBA2RGB)
 
-        # 2. OCR 실행
+        # 2. OCR 실행 (PaddleOCR)
         reader = get_ocr_reader(target_lang)
-        results = reader.readtext(image_np)
+        results = reader.ocr(image_np)
 
         # 3. 텍스트 없으면 통과 (예외 케이스)
-        if not results or len(results) == 0:
+        # PaddleOCR returns: [[[box], (text, conf)], ...] or None
+        if results is None or len(results) == 0 or results[0] is None or len(results[0]) == 0:
             return {
                 "valid": True,
                 "reason": "텍스트 없음 - 검증 통과",
@@ -137,11 +138,14 @@ def validate_translation_language(image_base64: str, target_lang: str, threshold
                 "detected_text": []
             }
 
-        # 4. 감지된 텍스트 분석
+        # 4. 감지된 텍스트 분석 (PaddleOCR 형식)
         detected_texts = []
         total_chars = 0
 
-        for (bbox, text, confidence) in results:
+        for line in results[0]:
+            # PaddleOCR format: [box_coords, (text, confidence)]
+            text = line[1][0]
+            confidence = line[1][1]
             if confidence > 0.3:  # 신뢰도 30% 이상만
                 detected_texts.append({
                     "text": text,
