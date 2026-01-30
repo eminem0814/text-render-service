@@ -27,6 +27,10 @@ COPY server.py .
 ENV PORT=5001
 ENV WORKERS=2
 ENV PYTHONUNBUFFERED=1
+# PaddlePaddle 호환성 설정
+ENV FLAGS_enable_pir_api=0
+ENV FLAGS_enable_pir_in_executor=0
+ENV FLAGS_use_mkldnn=0
 
 # 헬스체크 (PaddleOCR 초기화 시간 고려)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
