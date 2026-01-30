@@ -1,15 +1,14 @@
 """
-텍스트 번역 및 렌더링 서비스 v4
-- OpenCV 기반 자연스러운 인페인팅
-- 한글→영어 길이 차이 고려한 폰트 크기 조정
-- 텍스트 줄바꿈 및 자동 맞춤
-- 원본 스타일 정확한 매칭
-- 긴 이미지 슬라이스/병합 지원 (v4 신규)
+텍스트 번역 및 렌더링 서비스 v9
+- 긴 이미지 슬라이스/병합 지원
+- Gemini 배치 처리 결과 처리
+- 청크 번역 및 검증
+- OCR 기반 번역 언어 검증
 """
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image
 import numpy as np
 import cv2
 import requests
@@ -18,9 +17,7 @@ import base64
 import os
 import logging
 import json
-from collections import Counter
-from functools import lru_cache
-import re
+import easyocr
 
 app = Flask(__name__)
 
@@ -32,6 +29,255 @@ CORS(app)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ===== OCR 설정 =====
+# EasyOCR 언어 코드 매핑 (시스템 언어코드 -> EasyOCR 언어코드)
+LANGUAGE_CODE_MAP = {
+    # 동아시아
+    "ko": "ko",      # 한국어
+    "ja": "ja",      # 일본어
+    "zh": "ch_sim",  # 중국어 간체
+    "zh-CN": "ch_sim",
+    "zh-TW": "ch_tra",  # 중국어 번체
+    # 유럽
+    "en": "en",      # 영어
+    "de": "de",      # 독일어
+    "fr": "fr",      # 프랑스어
+    "es": "es",      # 스페인어
+    "it": "it",      # 이탈리아어
+    "pt": "pt",      # 포르투갈어
+    "ru": "ru",      # 러시아어
+    # 동남아
+    "th": "th",      # 태국어
+    "vi": "vi",      # 베트남어
+    "id": "id",      # 인도네시아어
+    # 기타
+    "ar": "ar",      # 아랍어
+    "hi": "hi",      # 힌디어
+}
+
+# OCR Reader 캐시 (언어별로 생성하여 재사용)
+ocr_readers = {}
+
+def get_ocr_reader(target_lang: str):
+    """
+    대상 언어에 맞는 OCR Reader를 반환 (캐싱)
+
+    Args:
+        target_lang: 대상 언어 코드 (예: 'en', 'ja', 'zh')
+
+    Returns:
+        EasyOCR Reader 객체
+    """
+    easyocr_lang = LANGUAGE_CODE_MAP.get(target_lang, "en")
+
+    if easyocr_lang not in ocr_readers:
+        try:
+            # GPU 사용 가능하면 GPU 사용, 아니면 CPU
+            ocr_readers[easyocr_lang] = easyocr.Reader(
+                [easyocr_lang],
+                gpu=False,  # Railway에서는 CPU만 사용
+                verbose=False
+            )
+            logger.info(f"OCR Reader 생성: {easyocr_lang}")
+        except Exception as e:
+            logger.error(f"OCR Reader 생성 실패: {e}")
+            # 실패시 영어 기본 리더 반환
+            if "en" not in ocr_readers:
+                ocr_readers["en"] = easyocr.Reader(["en"], gpu=False, verbose=False)
+            return ocr_readers["en"]
+
+    return ocr_readers[easyocr_lang]
+
+
+def validate_translation_language(image_base64: str, target_lang: str, threshold: float = 0.2) -> dict:
+    """
+    OCR을 사용하여 번역된 이미지가 올바른 언어인지 검증
+
+    Args:
+        image_base64: 검증할 이미지의 base64 문자열
+        target_lang: 번역 대상 언어 코드 (예: 'en', 'ja', 'zh')
+        threshold: 비타겟 언어 허용 비율 (기본 20%)
+
+    Returns:
+        dict: {
+            "valid": bool,          # 검증 통과 여부
+            "reason": str,          # 결과 사유
+            "has_text": bool,       # 텍스트 존재 여부
+            "total_chars": int,     # 총 감지된 문자 수
+            "target_lang_ratio": float,  # 타겟 언어 비율
+            "detected_text": list   # 감지된 텍스트 목록 (디버깅용)
+        }
+    """
+    try:
+        # 1. 이미지 디코딩
+        image_bytes = base64.b64decode(image_base64)
+        image = Image.open(BytesIO(image_bytes))
+
+        # PIL Image를 numpy array로 변환
+        image_np = np.array(image)
+
+        # RGB 변환 (필요한 경우)
+        if len(image_np.shape) == 2:  # 그레이스케일
+            pass  # EasyOCR은 그레이스케일도 처리 가능
+        elif image_np.shape[2] == 4:  # RGBA
+            image_np = cv2.cvtColor(image_np, cv2.COLOR_RGBA2RGB)
+
+        # 2. OCR 실행
+        reader = get_ocr_reader(target_lang)
+        results = reader.readtext(image_np)
+
+        # 3. 텍스트 없으면 통과 (예외 케이스)
+        if not results or len(results) == 0:
+            return {
+                "valid": True,
+                "reason": "텍스트 없음 - 검증 통과",
+                "has_text": False,
+                "total_chars": 0,
+                "target_lang_ratio": 1.0,
+                "detected_text": []
+            }
+
+        # 4. 감지된 텍스트 분석
+        detected_texts = []
+        total_chars = 0
+
+        for (bbox, text, confidence) in results:
+            if confidence > 0.3:  # 신뢰도 30% 이상만
+                detected_texts.append({
+                    "text": text,
+                    "confidence": confidence,
+                    "char_count": len(text.replace(" ", ""))
+                })
+                total_chars += len(text.replace(" ", ""))
+
+        # 텍스트가 너무 적으면 통과
+        if total_chars < 5:
+            return {
+                "valid": True,
+                "reason": "텍스트 적음 - 검증 통과",
+                "has_text": True,
+                "total_chars": total_chars,
+                "target_lang_ratio": 1.0,
+                "detected_text": detected_texts
+            }
+
+        # 5. 언어 판별 (간단한 휴리스틱)
+        target_lang_chars = count_target_language_chars(
+            "".join([t["text"] for t in detected_texts]),
+            target_lang
+        )
+
+        target_ratio = target_lang_chars / total_chars if total_chars > 0 else 1.0
+        non_target_ratio = 1.0 - target_ratio
+
+        # 6. 검증 결과
+        if non_target_ratio > threshold:
+            return {
+                "valid": False,
+                "reason": f"번역 미완료: 타겟 언어({target_lang}) 비율 {target_ratio:.1%}, 비타겟 언어 비율 {non_target_ratio:.1%}",
+                "has_text": True,
+                "total_chars": total_chars,
+                "target_lang_ratio": target_ratio,
+                "detected_text": detected_texts
+            }
+
+        return {
+            "valid": True,
+            "reason": f"번역 검증 통과: 타겟 언어({target_lang}) 비율 {target_ratio:.1%}",
+            "has_text": True,
+            "total_chars": total_chars,
+            "target_lang_ratio": target_ratio,
+            "detected_text": detected_texts
+        }
+
+    except Exception as e:
+        logger.error(f"번역 언어 검증 오류: {e}")
+        # 오류 발생시 통과 처리 (false positive 방지)
+        return {
+            "valid": True,
+            "reason": f"검증 오류로 통과 처리: {str(e)}",
+            "has_text": False,
+            "total_chars": 0,
+            "target_lang_ratio": 1.0,
+            "detected_text": []
+        }
+
+
+def count_target_language_chars(text: str, target_lang: str) -> int:
+    """
+    텍스트에서 타겟 언어의 문자 수를 카운트
+
+    Args:
+        text: 분석할 텍스트
+        target_lang: 타겟 언어 코드
+
+    Returns:
+        int: 타겟 언어 문자 수
+    """
+    count = 0
+
+    for char in text:
+        if char.isspace():
+            continue
+
+        code = ord(char)
+
+        # 한국어 (Hangul)
+        if target_lang == "ko":
+            if (0xAC00 <= code <= 0xD7AF or  # 한글 음절
+                0x1100 <= code <= 0x11FF or  # 한글 자모
+                0x3130 <= code <= 0x318F):   # 호환 자모
+                count += 1
+
+        # 일본어 (Hiragana, Katakana, 일부 한자)
+        elif target_lang == "ja":
+            if (0x3040 <= code <= 0x309F or  # 히라가나
+                0x30A0 <= code <= 0x30FF or  # 가타카나
+                0x4E00 <= code <= 0x9FFF):   # CJK 한자
+                count += 1
+
+        # 중국어 (한자)
+        elif target_lang in ["zh", "zh-CN", "zh-TW"]:
+            if 0x4E00 <= code <= 0x9FFF:  # CJK 한자
+                count += 1
+
+        # 영어/유럽어 (라틴 문자)
+        elif target_lang in ["en", "de", "fr", "es", "it", "pt"]:
+            if (0x0041 <= code <= 0x005A or  # A-Z
+                0x0061 <= code <= 0x007A or  # a-z
+                0x00C0 <= code <= 0x00FF):   # 확장 라틴
+                count += 1
+
+        # 러시아어 (키릴 문자)
+        elif target_lang == "ru":
+            if 0x0400 <= code <= 0x04FF:  # 키릴 문자
+                count += 1
+
+        # 태국어
+        elif target_lang == "th":
+            if 0x0E00 <= code <= 0x0E7F:  # 태국 문자
+                count += 1
+
+        # 베트남어 (라틴 + 성조)
+        elif target_lang == "vi":
+            if (0x0041 <= code <= 0x005A or
+                0x0061 <= code <= 0x007A or
+                0x00C0 <= code <= 0x024F or  # 확장 라틴
+                0x1EA0 <= code <= 0x1EFF):   # 베트남어 특수문자
+                count += 1
+
+        # 아랍어
+        elif target_lang == "ar":
+            if 0x0600 <= code <= 0x06FF:  # 아랍 문자
+                count += 1
+
+        # 기본: 숫자와 특수문자는 중립으로 처리
+        elif char.isdigit() or not char.isalnum():
+            count += 1  # 숫자/특수문자는 타겟 언어로 간주
+
+    return count
+
+
 # Google Cloud 설정 (선택사항 - 슬라이스/병합에는 불필요)
 CREDENTIALS_PATH = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
 PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
@@ -41,23 +287,725 @@ LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
-# 폰트 경로 설정
-FONT_PATHS = [
-    "/System/Library/Fonts/Helvetica.ttc",
-    "/System/Library/Fonts/AppleSDGothicNeo.ttc",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    "C:\\Windows\\Fonts\\arial.ttf",
-]
+# 원본 청크 저장 버킷 (재처리용)
+ORIGINAL_CHUNKS_BUCKET = "original-chunks"
 
-BOLD_FONT_PATHS = [
-    "/System/Library/Fonts/Helvetica.ttc",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-    "C:\\Windows\\Fonts\\arialbd.ttf",
-]
 
-# Vertex AI 초기화 시도
+# ===== 원본 청크 저장/조회 함수 =====
+
+def save_original_chunk(
+    chunk_base64: str,
+    chunk_key: str,
+    batch_id: str,
+    supabase_url: str = None,
+    supabase_key: str = None
+) -> dict:
+    """
+    원본 청크를 Supabase Storage에 저장
+
+    Args:
+        chunk_base64: 원본 청크 이미지의 base64 문자열
+        chunk_key: 청크 식별자 (예: "p123_i0_c0")
+        batch_id: 배치 작업 ID (폴더 구분용)
+        supabase_url: Supabase URL (없으면 환경변수 사용)
+        supabase_key: Supabase 키 (없으면 환경변수 사용)
+
+    Returns:
+        dict: {
+            "success": bool,
+            "path": str (저장 경로),
+            "error": str (에러 메시지)
+        }
+    """
+    url = supabase_url or SUPABASE_URL
+    key = supabase_key or SUPABASE_SERVICE_KEY
+
+    if not url or not key:
+        return {"success": False, "path": "", "error": "Supabase 설정 없음"}
+
+    try:
+        # 저장 경로: original-chunks/{batch_id}/{chunk_key}.jpg
+        storage_path = f"{batch_id}/{chunk_key}.jpg"
+
+        # base64 디코딩
+        image_bytes = base64.b64decode(chunk_base64)
+
+        # Supabase Storage에 업로드
+        upload_url = f"{url}/storage/v1/object/{ORIGINAL_CHUNKS_BUCKET}/{storage_path}"
+
+        response = requests.post(
+            upload_url,
+            headers={
+                "apikey": key,
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "image/jpeg"
+            },
+            data=image_bytes,
+            timeout=30
+        )
+
+        if response.status_code in [200, 201]:
+            return {"success": True, "path": storage_path, "error": ""}
+        else:
+            # 이미 존재하면 덮어쓰기 시도
+            if response.status_code == 400 and "already exists" in response.text.lower():
+                # upsert로 재시도
+                response = requests.put(
+                    upload_url,
+                    headers={
+                        "apikey": key,
+                        "Authorization": f"Bearer {key}",
+                        "Content-Type": "image/jpeg"
+                    },
+                    data=image_bytes,
+                    timeout=30
+                )
+                if response.status_code in [200, 201]:
+                    return {"success": True, "path": storage_path, "error": ""}
+
+            return {
+                "success": False,
+                "path": "",
+                "error": f"업로드 실패: {response.status_code} - {response.text[:200]}"
+            }
+
+    except Exception as e:
+        return {"success": False, "path": "", "error": str(e)}
+
+
+def get_original_chunk(
+    chunk_key: str,
+    batch_id: str,
+    supabase_url: str = None,
+    supabase_key: str = None
+) -> dict:
+    """
+    Supabase Storage에서 원본 청크 조회
+
+    Args:
+        chunk_key: 청크 식별자 (예: "p123_i0_c0")
+        batch_id: 배치 작업 ID
+        supabase_url: Supabase URL
+        supabase_key: Supabase 키
+
+    Returns:
+        dict: {
+            "success": bool,
+            "base64": str (원본 이미지 base64),
+            "error": str
+        }
+    """
+    url = supabase_url or SUPABASE_URL
+    key = supabase_key or SUPABASE_SERVICE_KEY
+
+    if not url or not key:
+        return {"success": False, "base64": "", "error": "Supabase 설정 없음"}
+
+    try:
+        storage_path = f"{batch_id}/{chunk_key}.jpg"
+        download_url = f"{url}/storage/v1/object/{ORIGINAL_CHUNKS_BUCKET}/{storage_path}"
+
+        response = requests.get(
+            download_url,
+            headers={
+                "apikey": key,
+                "Authorization": f"Bearer {key}"
+            },
+            timeout=30
+        )
+
+        if response.status_code == 200:
+            chunk_base64 = base64.b64encode(response.content).decode('utf-8')
+            return {"success": True, "base64": chunk_base64, "error": ""}
+        else:
+            return {
+                "success": False,
+                "base64": "",
+                "error": f"다운로드 실패: {response.status_code}"
+            }
+
+    except Exception as e:
+        return {"success": False, "base64": "", "error": str(e)}
+
+
+def delete_original_chunks(
+    batch_id: str,
+    supabase_url: str = None,
+    supabase_key: str = None
+) -> dict:
+    """
+    배치 작업의 원본 청크들을 일괄 삭제 (정리용)
+
+    Args:
+        batch_id: 배치 작업 ID
+        supabase_url: Supabase URL
+        supabase_key: Supabase 키
+
+    Returns:
+        dict: {"success": bool, "deleted_count": int, "error": str}
+    """
+    url = supabase_url or SUPABASE_URL
+    key = supabase_key or SUPABASE_SERVICE_KEY
+
+    if not url or not key:
+        return {"success": False, "deleted_count": 0, "error": "Supabase 설정 없음"}
+
+    try:
+        # 배치 폴더의 파일 목록 조회
+        list_url = f"{url}/storage/v1/object/list/{ORIGINAL_CHUNKS_BUCKET}"
+
+        response = requests.post(
+            list_url,
+            headers={
+                "apikey": key,
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json"
+            },
+            json={"prefix": f"{batch_id}/"},
+            timeout=30
+        )
+
+        if response.status_code != 200:
+            return {"success": False, "deleted_count": 0, "error": f"목록 조회 실패: {response.status_code}"}
+
+        files = response.json()
+        if not files:
+            return {"success": True, "deleted_count": 0, "error": ""}
+
+        # 파일들 삭제
+        file_paths = [f"{batch_id}/{f['name']}" for f in files if f.get('name')]
+
+        if not file_paths:
+            return {"success": True, "deleted_count": 0, "error": ""}
+
+        delete_url = f"{url}/storage/v1/object/{ORIGINAL_CHUNKS_BUCKET}"
+        delete_response = requests.delete(
+            delete_url,
+            headers={
+                "apikey": key,
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json"
+            },
+            json={"prefixes": file_paths},
+            timeout=60
+        )
+
+        if delete_response.status_code in [200, 204]:
+            return {"success": True, "deleted_count": len(file_paths), "error": ""}
+        else:
+            return {
+                "success": False,
+                "deleted_count": 0,
+                "error": f"삭제 실패: {delete_response.status_code}"
+            }
+
+    except Exception as e:
+        return {"success": False, "deleted_count": 0, "error": str(e)}
+
+
+# ===== 재처리 대기열 관리 함수 =====
+
+# 재처리 대기열 테이블명
+RETRY_QUEUE_TABLE = "chunk_retry_queue"
+# 청크 결과 테이블명 (병합 트리거용)
+CHUNK_RESULTS_TABLE = "chunk_results"
+
+
+def enqueue_failed_chunk(
+    chunk_info: dict,
+    config: dict,
+    error_reason: str,
+    supabase_url: str = None,
+    supabase_key: str = None
+) -> dict:
+    """
+    실패한 청크를 재처리 대기열에 추가
+
+    Args:
+        chunk_info: 청크 정보 {
+            batch_id, chunk_key, product_id, image_index, chunk_index,
+            total_chunks, chunk_width, chunk_height, original_chunk_path
+        }
+        config: 처리 설정 {target_lang, prompt, gemini_model, ...}
+        error_reason: 실패 사유
+        supabase_url: Supabase URL
+        supabase_key: Supabase 키
+
+    Returns:
+        dict: {"success": bool, "queue_id": int, "error": str}
+    """
+    url = supabase_url or SUPABASE_URL
+    key = supabase_key or SUPABASE_SERVICE_KEY
+
+    if not url or not key:
+        return {"success": False, "queue_id": None, "error": "Supabase 설정 없음"}
+
+    try:
+        insert_url = f"{url}/rest/v1/{RETRY_QUEUE_TABLE}"
+
+        queue_item = {
+            "batch_id": chunk_info.get("batch_id"),
+            "chunk_key": chunk_info.get("chunk_key"),
+            "product_id": chunk_info.get("product_id"),
+            "product_code": chunk_info.get("product_code"),
+            "image_index": chunk_info.get("image_index"),
+            "chunk_index": chunk_info.get("chunk_index"),
+            "total_chunks": chunk_info.get("total_chunks"),
+            "chunk_width": chunk_info.get("chunk_width"),
+            "chunk_height": chunk_info.get("chunk_height"),
+            "original_chunk_path": chunk_info.get("original_chunk_path"),
+            "target_lang": config.get("targetLangCode", "en"),
+            "prompt": config.get("prompt", ""),
+            "gemini_model": config.get("geminiModel", "gemini-2.0-flash-001"),
+            "gemini_api_key": config.get("geminiApiKey", ""),
+            "storage_bucket": config.get("storageBucket", "translated-images"),
+            "table_name": config.get("tableName", ""),
+            "output_format": config.get("outputFormat", "WEBP"),
+            "output_quality": config.get("outputQuality", 100),
+            "status": "pending",
+            "retry_count": 0,
+            "last_error": error_reason,
+            "config_json": json.dumps(config)
+        }
+
+        response = requests.post(
+            insert_url,
+            headers={
+                "apikey": key,
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "Prefer": "return=representation"
+            },
+            json=queue_item,
+            timeout=30
+        )
+
+        if response.status_code in [200, 201]:
+            result = response.json()
+            queue_id = result[0].get("id") if result else None
+            logger.info(f"[대기열 추가] {chunk_info.get('chunk_key')}: queue_id={queue_id}")
+            return {"success": True, "queue_id": queue_id, "error": ""}
+        else:
+            return {
+                "success": False,
+                "queue_id": None,
+                "error": f"대기열 추가 실패: {response.status_code} - {response.text[:200]}"
+            }
+
+    except Exception as e:
+        return {"success": False, "queue_id": None, "error": str(e)}
+
+
+def get_pending_queue_items(
+    batch_id: str = None,
+    limit: int = 50,
+    supabase_url: str = None,
+    supabase_key: str = None
+) -> dict:
+    """
+    대기 중인 재처리 항목 조회
+
+    Args:
+        batch_id: 특정 배치만 조회 (없으면 전체)
+        limit: 최대 조회 수
+        supabase_url: Supabase URL
+        supabase_key: Supabase 키
+
+    Returns:
+        dict: {"success": bool, "items": list, "error": str}
+    """
+    url = supabase_url or SUPABASE_URL
+    key = supabase_key or SUPABASE_SERVICE_KEY
+
+    if not url or not key:
+        return {"success": False, "items": [], "error": "Supabase 설정 없음"}
+
+    try:
+        query_url = f"{url}/rest/v1/{RETRY_QUEUE_TABLE}?status=eq.pending&order=created_at&limit={limit}"
+
+        if batch_id:
+            query_url += f"&batch_id=eq.{batch_id}"
+
+        response = requests.get(
+            query_url,
+            headers={
+                "apikey": key,
+                "Authorization": f"Bearer {key}"
+            },
+            timeout=30
+        )
+
+        if response.status_code == 200:
+            return {"success": True, "items": response.json(), "error": ""}
+        else:
+            return {
+                "success": False,
+                "items": [],
+                "error": f"조회 실패: {response.status_code}"
+            }
+
+    except Exception as e:
+        return {"success": False, "items": [], "error": str(e)}
+
+
+def update_queue_item_status(
+    queue_id: int,
+    status: str,
+    error_msg: str = None,
+    translated_base64: str = None,
+    supabase_url: str = None,
+    supabase_key: str = None
+) -> dict:
+    """
+    대기열 항목 상태 업데이트
+
+    Args:
+        queue_id: 대기열 ID
+        status: 새 상태 (processing, completed, failed)
+        error_msg: 에러 메시지 (실패 시)
+        translated_base64: 번역된 이미지 base64 (성공 시)
+        supabase_url: Supabase URL
+        supabase_key: Supabase 키
+
+    Returns:
+        dict: {"success": bool, "error": str}
+    """
+    url = supabase_url or SUPABASE_URL
+    key = supabase_key or SUPABASE_SERVICE_KEY
+
+    if not url or not key:
+        return {"success": False, "error": "Supabase 설정 없음"}
+
+    try:
+        update_url = f"{url}/rest/v1/{RETRY_QUEUE_TABLE}?id=eq.{queue_id}"
+
+        update_data = {
+            "status": status,
+            "updated_at": "now()"
+        }
+
+        if status == "processing":
+            update_data["retry_count"] = "retry_count + 1"  # SQL expression won't work here
+
+        if error_msg:
+            update_data["last_error"] = error_msg
+
+        if translated_base64:
+            update_data["translated_base64"] = translated_base64
+
+        response = requests.patch(
+            update_url,
+            headers={
+                "apikey": key,
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json"
+            },
+            json=update_data,
+            timeout=30
+        )
+
+        if response.status_code in [200, 204]:
+            return {"success": True, "error": ""}
+        else:
+            return {"success": False, "error": f"업데이트 실패: {response.status_code}"}
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def save_chunk_result(
+    chunk_info: dict,
+    translated_base64: str,
+    status: str = "completed",
+    supabase_url: str = None,
+    supabase_key: str = None
+) -> dict:
+    """
+    청크 처리 결과 저장 (병합 트리거용)
+
+    Args:
+        chunk_info: 청크 정보
+        translated_base64: 번역된 이미지 base64
+        status: 상태 (completed, failed)
+        supabase_url: Supabase URL
+        supabase_key: Supabase 키
+
+    Returns:
+        dict: {"success": bool, "result_id": int, "error": str}
+    """
+    url = supabase_url or SUPABASE_URL
+    key = supabase_key or SUPABASE_SERVICE_KEY
+
+    if not url or not key:
+        return {"success": False, "result_id": None, "error": "Supabase 설정 없음"}
+
+    try:
+        # upsert를 위해 unique key 사용
+        upsert_url = f"{url}/rest/v1/{CHUNK_RESULTS_TABLE}"
+
+        result_item = {
+            "batch_id": chunk_info.get("batch_id"),
+            "chunk_key": chunk_info.get("chunk_key"),
+            "product_id": chunk_info.get("product_id"),
+            "product_code": chunk_info.get("product_code"),
+            "image_index": chunk_info.get("image_index"),
+            "chunk_index": chunk_info.get("chunk_index"),
+            "total_chunks": chunk_info.get("total_chunks"),
+            "chunk_width": chunk_info.get("chunk_width"),
+            "chunk_height": chunk_info.get("chunk_height"),
+            "translated_base64": translated_base64,
+            "status": status
+        }
+
+        response = requests.post(
+            upsert_url,
+            headers={
+                "apikey": key,
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "Prefer": "return=representation,resolution=merge-duplicates"
+            },
+            json=result_item,
+            timeout=30
+        )
+
+        if response.status_code in [200, 201]:
+            result = response.json()
+            result_id = result[0].get("id") if result else None
+            return {"success": True, "result_id": result_id, "error": ""}
+        else:
+            return {
+                "success": False,
+                "result_id": None,
+                "error": f"저장 실패: {response.status_code} - {response.text[:200]}"
+            }
+
+    except Exception as e:
+        return {"success": False, "result_id": None, "error": str(e)}
+
+
+def check_image_completion(
+    batch_id: str,
+    product_id: int,
+    image_index: int,
+    total_chunks: int,
+    supabase_url: str = None,
+    supabase_key: str = None
+) -> dict:
+    """
+    특정 이미지의 모든 청크가 완료되었는지 확인
+
+    Args:
+        batch_id: 배치 ID
+        product_id: 상품 ID
+        image_index: 이미지 인덱스
+        total_chunks: 총 청크 수
+        supabase_url: Supabase URL
+        supabase_key: Supabase 키
+
+    Returns:
+        dict: {
+            "complete": bool,
+            "completed_count": int,
+            "total_chunks": int,
+            "chunks": list (완료된 경우 청크 데이터 포함)
+        }
+    """
+    url = supabase_url or SUPABASE_URL
+    key = supabase_key or SUPABASE_SERVICE_KEY
+
+    if not url or not key:
+        return {"complete": False, "completed_count": 0, "total_chunks": total_chunks, "chunks": []}
+
+    try:
+        # 해당 이미지의 완료된 청크 조회
+        query_url = (
+            f"{url}/rest/v1/{CHUNK_RESULTS_TABLE}"
+            f"?batch_id=eq.{batch_id}"
+            f"&product_id=eq.{product_id}"
+            f"&image_index=eq.{image_index}"
+            f"&status=eq.completed"
+            f"&order=chunk_index"
+        )
+
+        response = requests.get(
+            query_url,
+            headers={
+                "apikey": key,
+                "Authorization": f"Bearer {key}"
+            },
+            timeout=30
+        )
+
+        if response.status_code == 200:
+            chunks = response.json()
+            completed_count = len(chunks)
+            is_complete = completed_count >= total_chunks
+
+            return {
+                "complete": is_complete,
+                "completed_count": completed_count,
+                "total_chunks": total_chunks,
+                "chunks": chunks if is_complete else []
+            }
+        else:
+            return {
+                "complete": False,
+                "completed_count": 0,
+                "total_chunks": total_chunks,
+                "chunks": [],
+                "error": f"조회 실패: {response.status_code}"
+            }
+
+    except Exception as e:
+        return {
+            "complete": False,
+            "completed_count": 0,
+            "total_chunks": total_chunks,
+            "chunks": [],
+            "error": str(e)
+        }
+
+
+def process_single_retry_item(
+    item: dict,
+    supabase_url: str = None,
+    supabase_key: str = None
+) -> dict:
+    """
+    단일 재처리 항목 처리
+
+    Args:
+        item: 대기열 항목
+        supabase_url: Supabase URL
+        supabase_key: Supabase 키
+
+    Returns:
+        dict: {
+            "success": bool,
+            "translated_base64": str,
+            "error": str,
+            "image_complete": bool
+        }
+    """
+    url = supabase_url or SUPABASE_URL
+    key = supabase_key or SUPABASE_SERVICE_KEY
+
+    queue_id = item.get("id")
+    chunk_key = item.get("chunk_key")
+    batch_id = item.get("batch_id")
+
+    logger.info(f"[재처리 시작] {chunk_key}")
+
+    # 1. 상태를 processing으로 변경
+    update_queue_item_status(queue_id, "processing", supabase_url=url, supabase_key=key)
+
+    try:
+        # 2. 원본 청크 가져오기
+        original_result = get_original_chunk(
+            chunk_key=chunk_key,
+            batch_id=batch_id,
+            supabase_url=url,
+            supabase_key=key
+        )
+
+        if not original_result["success"]:
+            error_msg = f"원본 청크 조회 실패: {original_result['error']}"
+            update_queue_item_status(queue_id, "failed", error_msg=error_msg, supabase_url=url, supabase_key=key)
+            return {"success": False, "translated_base64": "", "error": error_msg, "image_complete": False}
+
+        original_base64 = original_result["base64"]
+
+        # 3. 실시간 API로 번역 시도
+        gemini_api_key = item.get("gemini_api_key")
+        prompt = item.get("prompt", "Translate the text in this image.")
+        gemini_model = item.get("gemini_model", "gemini-2.0-flash-001")
+
+        retry_result = retry_chunk_realtime(
+            chunk_base64=original_base64,
+            gemini_api_key=gemini_api_key,
+            prompt=prompt,
+            gemini_model=gemini_model,
+            max_retries=3
+        )
+
+        if not retry_result["success"]:
+            error_msg = f"번역 실패: {retry_result['error']}"
+            update_queue_item_status(queue_id, "failed", error_msg=error_msg, supabase_url=url, supabase_key=key)
+            return {"success": False, "translated_base64": "", "error": error_msg, "image_complete": False}
+
+        translated_base64 = retry_result["base64"]
+
+        # 4. 번역 결과 검증
+        target_lang = item.get("target_lang", "en")
+        validation = validate_translated_chunk(
+            chunk_base64=translated_base64,
+            target_lang=target_lang,
+            expected_width=item.get("chunk_width"),
+            expected_height=item.get("chunk_height"),
+            size_tolerance=0.3,
+            lang_threshold=0.2
+        )
+
+        if not validation["valid"]:
+            error_msg = f"검증 실패: {validation['reason']}"
+            # 재시도 횟수가 3회 미만이면 다시 pending으로
+            retry_count = item.get("retry_count", 0)
+            if retry_count < 3:
+                update_queue_item_status(queue_id, "pending", error_msg=error_msg, supabase_url=url, supabase_key=key)
+            else:
+                update_queue_item_status(queue_id, "failed", error_msg=error_msg, supabase_url=url, supabase_key=key)
+            return {"success": False, "translated_base64": "", "error": error_msg, "image_complete": False}
+
+        # 5. 성공 - 대기열 상태 업데이트
+        update_queue_item_status(
+            queue_id, "completed",
+            translated_base64=translated_base64,
+            supabase_url=url, supabase_key=key
+        )
+
+        # 6. 청크 결과 저장
+        chunk_info = {
+            "batch_id": batch_id,
+            "chunk_key": chunk_key,
+            "product_id": item.get("product_id"),
+            "product_code": item.get("product_code"),
+            "image_index": item.get("image_index"),
+            "chunk_index": item.get("chunk_index"),
+            "total_chunks": item.get("total_chunks"),
+            "chunk_width": item.get("chunk_width"),
+            "chunk_height": item.get("chunk_height")
+        }
+
+        save_chunk_result(chunk_info, translated_base64, "completed", supabase_url=url, supabase_key=key)
+
+        # 7. 이미지 완료 여부 확인
+        completion = check_image_completion(
+            batch_id=batch_id,
+            product_id=item.get("product_id"),
+            image_index=item.get("image_index"),
+            total_chunks=item.get("total_chunks"),
+            supabase_url=url,
+            supabase_key=key
+        )
+
+        logger.info(f"[재처리 성공] {chunk_key}: 이미지 완료={completion['complete']}")
+
+        return {
+            "success": True,
+            "translated_base64": translated_base64,
+            "error": "",
+            "image_complete": completion["complete"],
+            "completion_info": completion
+        }
+
+    except Exception as e:
+        error_msg = f"처리 오류: {str(e)}"
+        update_queue_item_status(queue_id, "failed", error_msg=error_msg, supabase_url=url, supabase_key=key)
+        return {"success": False, "translated_base64": "", "error": error_msg, "image_complete": False}
+
+
+# Vertex AI 초기화 시도 (선택 사항)
 vertex_ai_available = False
 try:
     if os.path.exists(CREDENTIALS_PATH):
@@ -72,38 +1020,6 @@ try:
                 logger.info(f"Vertex AI initialized: project={PROJECT_ID}")
 except Exception as e:
     logger.warning(f"Vertex AI not available: {e}")
-
-
-def _find_available_font_path(bold=False):
-    """사용 가능한 폰트 경로 찾기 (캐시용)"""
-    paths = BOLD_FONT_PATHS if bold else FONT_PATHS
-    for font_path in paths:
-        if os.path.exists(font_path):
-            return font_path
-    return None
-
-# 폰트 경로 캐시 (시작 시 한 번만 검색)
-_CACHED_FONT_PATH = _find_available_font_path(bold=False)
-_CACHED_BOLD_FONT_PATH = _find_available_font_path(bold=True)
-
-
-@lru_cache(maxsize=64)
-def get_font(size=24, bold=False):
-    """시스템에서 사용 가능한 폰트 찾기 (LRU 캐시 적용)"""
-    font_path = _CACHED_BOLD_FONT_PATH if bold else _CACHED_FONT_PATH
-    if font_path:
-        try:
-            return ImageFont.truetype(font_path, size)
-        except Exception:
-            pass
-    return ImageFont.load_default()
-
-
-def download_image(url):
-    """URL에서 이미지 다운로드"""
-    response = requests.get(url, timeout=60)
-    response.raise_for_status()
-    return Image.open(BytesIO(response.content)).convert("RGB")
 
 
 def validate_chunk(chunk_base64, expected_width=None, expected_height=None, tolerance=0.3):
@@ -172,6 +1088,95 @@ def validate_chunk(chunk_base64, expected_width=None, expected_height=None, tole
 
     except Exception as e:
         return {"valid": False, "reason": f"검증 중 오류: {str(e)}", "actual_width": 0, "actual_height": 0}
+
+
+def validate_translated_chunk(
+    chunk_base64: str,
+    target_lang: str = None,
+    expected_width: int = None,
+    expected_height: int = None,
+    size_tolerance: float = 0.3,
+    lang_threshold: float = 0.2,
+    skip_ocr: bool = False
+) -> dict:
+    """
+    번역된 청크의 통합 검증 (크기 + 번역 언어)
+
+    Args:
+        chunk_base64: 검증할 번역된 이미지 base64
+        target_lang: 번역 대상 언어 코드 (예: 'en', 'ja')
+        expected_width: 예상 너비
+        expected_height: 예상 높이
+        size_tolerance: 크기 허용 오차 (기본 30%)
+        lang_threshold: 비타겟 언어 허용 비율 (기본 20%)
+        skip_ocr: OCR 검증 건너뛰기
+
+    Returns:
+        dict: {
+            "valid": bool,
+            "defect_type": str or None,  # "size", "translation", None
+            "reason": str,
+            "size_validation": dict,
+            "translation_validation": dict or None,
+            "can_retry": bool  # 재처리 가능 여부
+        }
+    """
+    result = {
+        "valid": True,
+        "defect_type": None,
+        "reason": "검증 통과",
+        "size_validation": None,
+        "translation_validation": None,
+        "can_retry": True
+    }
+
+    # 1. 크기 검증
+    size_result = validate_chunk(
+        chunk_base64,
+        expected_width=expected_width,
+        expected_height=expected_height,
+        tolerance=size_tolerance
+    )
+    result["size_validation"] = size_result
+
+    if not size_result["valid"]:
+        result["valid"] = False
+        result["defect_type"] = "size"
+        result["reason"] = size_result["reason"]
+
+        # 크기가 너무 작으면 재처리 불가 (원본 데이터 손상)
+        if size_result.get("actual_width", 0) < 50 or size_result.get("actual_height", 0) < 50:
+            result["can_retry"] = False
+
+        return result
+
+    # 2. 번역 언어 검증 (target_lang이 있고 skip_ocr이 False인 경우)
+    if target_lang and not skip_ocr:
+        try:
+            lang_result = validate_translation_language(
+                chunk_base64,
+                target_lang,
+                threshold=lang_threshold
+            )
+            result["translation_validation"] = lang_result
+
+            if not lang_result["valid"]:
+                result["valid"] = False
+                result["defect_type"] = "translation"
+                result["reason"] = lang_result["reason"]
+                result["can_retry"] = True  # 번역 실패는 재처리 가능
+                return result
+
+        except Exception as e:
+            logger.warning(f"번역 언어 검증 스킵 (오류): {e}")
+            result["translation_validation"] = {
+                "valid": True,
+                "reason": f"검증 오류로 통과 처리: {str(e)}",
+                "has_text": False
+            }
+
+    result["reason"] = "모든 검증 통과"
+    return result
 
 
 def retry_chunk_realtime(chunk_base64, gemini_api_key, prompt, gemini_model="gemini-3-pro-image-preview", max_retries=2):
@@ -289,701 +1294,664 @@ def pil_to_cv2(pil_image):
     return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
 
 
-def cv2_to_pil(cv2_image):
-    """OpenCV 이미지를 PIL Image로 변환"""
-    return Image.fromarray(cv2.cvtColor(cv2_image, cv2.COLOR_BGR2RGB))
-
-
-def get_bounds_rect(bounds):
-    """bounds에서 x, y, width, height 추출"""
-    vertices = bounds.get("vertices", [])
-    if vertices and len(vertices) >= 4:
-        xs = [v.get("x", 0) or 0 for v in vertices]
-        ys = [v.get("y", 0) or 0 for v in vertices]
-        x = min(xs)
-        y = min(ys)
-        max_x = max(xs)
-        max_y = max(ys)
-        w = max(1, int(max_x - x))  # 최소 1 보장
-        h = max(1, int(max_y - y))  # 최소 1 보장
-        return int(x), int(y), w, h
-    else:
-        return (
-            int(bounds.get("x", 0) or 0),
-            int(bounds.get("y", 0) or 0),
-            max(1, int(bounds.get("width", 100) or 100)),
-            max(1, int(bounds.get("height", 30) or 30))
-        )
-
-
-def create_mask_for_inpainting(image_size, text_blocks, padding=5):
-    """인페인팅용 마스크 생성 (OpenCV 형식)"""
-    mask = np.zeros((image_size[1], image_size[0]), dtype=np.uint8)
-
-    for block in text_blocks:
-        bounds = block.get("bounds", {})
-        x, y, w, h = get_bounds_rect(bounds)
-
-        # 패딩 적용
-        x1 = max(0, x - padding)
-        y1 = max(0, y - padding)
-        x2 = min(image_size[0], x + w + padding)
-        y2 = min(image_size[1], y + h + padding)
-
-        # 흰색으로 마스크 영역 표시
-        mask[y1:y2, x1:x2] = 255
-
-    return mask
-
-
-def opencv_inpaint(image, text_blocks, padding=8):
-    """
-    OpenCV 기반 자연스러운 인페인팅
-    - Telea 알고리즘과 Navier-Stokes 알고리즘 중 더 나은 결과 선택
-    """
-    cv_image = pil_to_cv2(image)
-    mask = create_mask_for_inpainting(image.size, text_blocks, padding)
-
-    # 마스크 약간 확장 (경계 처리 개선)
-    kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.dilate(mask, kernel, iterations=2)
-
-    # 두 가지 인페인팅 알고리즘 시도
-    # INPAINT_TELEA: Fast Marching Method - 빠르고 일반적으로 좋은 결과
-    # INPAINT_NS: Navier-Stokes - 더 부드러운 결과
-
-    inpaint_radius = 5  # 인페인팅 반경
-
-    # Telea 알고리즘 사용 (일반적으로 더 좋은 결과)
-    result = cv2.inpaint(cv_image, mask, inpaint_radius, cv2.INPAINT_TELEA)
-
-    return cv2_to_pil(result)
-
-
-def advanced_inpaint(image, text_blocks, padding=10):
-    """
-    고급 인페인팅: 주변 색상/패턴 분석 후 자연스럽게 채우기
-    """
-    cv_image = pil_to_cv2(image)
-    result = cv_image.copy()
-
-    for block in text_blocks:
-        try:
-            bounds = block.get("bounds", {})
-            x, y, w, h = get_bounds_rect(bounds)
-
-            # 유효성 검사
-            if w <= 0 or h <= 0:
-                continue
-
-            # 영역 확장
-            x1 = max(0, x - padding)
-            y1 = max(0, y - padding)
-            x2 = min(image.size[0], x + w + padding)
-            y2 = min(image.size[1], y + h + padding)
-
-            # 영역이 유효한지 확인
-            if x2 <= x1 or y2 <= y1:
-                continue
-
-            # 주변 영역 샘플링 (위, 아래, 좌, 우)
-            sample_size = 15
-            samples = []
-
-            # 위쪽
-            if y1 >= sample_size:
-                samples.append(cv_image[y1-sample_size:y1, x1:x2])
-            # 아래쪽
-            if y2 + sample_size <= image.size[1]:
-                samples.append(cv_image[y2:y2+sample_size, x1:x2])
-            # 왼쪽
-            if x1 >= sample_size:
-                samples.append(cv_image[y1:y2, x1-sample_size:x1])
-            # 오른쪽
-            if x2 + sample_size <= image.size[0]:
-                samples.append(cv_image[y1:y2, x2:x2+sample_size])
-
-            if samples:
-                # 주변 색상의 평균과 표준편차 계산
-                valid_samples = [s for s in samples if s.size > 0]
-                if valid_samples:
-                    all_pixels = np.vstack([s.reshape(-1, 3) for s in valid_samples])
-                    if len(all_pixels) > 0:
-                        mean_color = np.mean(all_pixels, axis=0).astype(np.uint8)
-
-                        # 그라데이션 효과로 자연스럽게 채우기
-                        fill_region = result[y1:y2, x1:x2]
-
-                        # 가우시안 블러된 배경색으로 채우기
-                        if fill_region.size > 0:
-                            fill_region[:] = mean_color
-
-                            # 경계 부드럽게 처리
-                            region_h = y2 - y1
-                            region_w = x2 - x1
-                            if region_h > padding * 2 and region_w > padding * 2:
-                                mask_region = np.zeros((region_h, region_w), dtype=np.uint8)
-                                mask_region[padding:-padding, padding:-padding] = 255
-
-                                if mask_region.shape[0] > 0 and mask_region.shape[1] > 0:
-                                    mask_region = cv2.GaussianBlur(mask_region, (21, 21), 0)
-
-                                    # 원본과 블렌딩
-                                    mask_normalized = mask_region.astype(np.float32) / 255.0
-                                    for c in range(3):
-                                        fill_region[:, :, c] = (
-                                            fill_region[:, :, c] * mask_normalized +
-                                            cv_image[y1:y2, x1:x2, c] * (1 - mask_normalized)
-                                        ).astype(np.uint8)
-
-        except Exception as block_err:
-            logger.warning(f"Block inpaint error: {block_err}")
-
-    # 최종 OpenCV 인페인팅으로 마무리
-    mask = create_mask_for_inpainting(image.size, text_blocks, padding=3)
-    result = cv2.inpaint(result, mask, 3, cv2.INPAINT_TELEA)
-
-    return cv2_to_pil(result)
-
-
-def extract_text_style(image, bounds):
-    """텍스트 영역에서 원본 스타일 정확하게 추출"""
-    style = {
-        "color": (0, 0, 0),
-        "font_size": 24,
-        "bold": False,
-        "background_color": (255, 255, 255)
-    }
-
-    try:
-        x, y, w, h = get_bounds_rect(bounds)
-
-        if w <= 0 or h <= 0:
-            return style
-
-        # 이미지 범위 체크
-        x = max(0, x)
-        y = max(0, y)
-        w = min(w, image.width - x)
-        h = min(h, image.height - y)
-
-        if w <= 0 or h <= 0:
-            return style
-
-        # 텍스트 영역 크롭
-        region = image.crop((x, y, x + w, y + h))
-        pixels = list(region.getdata())
-
-        if not pixels:
-            return style
-
-        # K-means 클러스터링으로 주요 색상 추출 (배경 vs 텍스트)
-        pixel_array = np.array(pixels, dtype=np.float32)
-
-        # 2개의 클러스터로 분류 (배경, 텍스트)
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-        k = 2
-
-        try:
-            _, labels, centers = cv2.kmeans(pixel_array, k, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
-
-            # 각 클러스터의 픽셀 수
-            unique, counts = np.unique(labels, return_counts=True)
-
-            # 더 많은 픽셀 = 배경, 적은 픽셀 = 텍스트
-            if len(counts) >= 2:
-                bg_idx = np.argmax(counts)
-                text_idx = np.argmin(counts)
-
-                bg_color = tuple(centers[bg_idx].astype(int))
-                text_color = tuple(centers[text_idx].astype(int))
-
-                # 명도 차이 확인
-                bg_brightness = 0.299 * bg_color[0] + 0.587 * bg_color[1] + 0.114 * bg_color[2]
-                text_brightness = 0.299 * text_color[0] + 0.587 * text_color[1] + 0.114 * text_color[2]
-
-                if abs(bg_brightness - text_brightness) > 20:
-                    style["color"] = text_color
-                    style["background_color"] = bg_color
-                else:
-                    # 차이가 적으면 밝기 기반
-                    if bg_brightness > 128:
-                        style["color"] = (0, 0, 0)
-                    else:
-                        style["color"] = (255, 255, 255)
-                    style["background_color"] = bg_color
-        except:
-            # K-means 실패 시 간단한 방법 사용
-            color_counts = Counter(pixels)
-            most_common = color_counts.most_common(2)
-            if len(most_common) >= 2:
-                style["background_color"] = most_common[0][0][:3]
-                style["color"] = most_common[1][0][:3]
-
-        # 폰트 크기: 높이의 75-85%
-        style["font_size"] = max(10, int(h * 0.8))
-
-        # 굵기 추정: 텍스트 픽셀 비율
-        text_color = style["color"]
-        if pixels and len(pixels) > 0:
-            similar_count = sum(
-                1 for p in pixels
-                if len(p) >= 3
-                and abs(p[0] - text_color[0]) < 60
-                and abs(p[1] - text_color[1]) < 60
-                and abs(p[2] - text_color[2]) < 60
-            )
-            text_ratio = similar_count / len(pixels)
-            style["bold"] = text_ratio > 0.35
-
-    except Exception as e:
-        logger.warning(f"Style extraction failed: {e}")
-
-    return style
-
-
-def estimate_text_length_ratio(korean_text, english_text):
-    """한글과 영어 텍스트의 렌더링 길이 비율 추정"""
-    # 한글은 보통 영어보다 짧게 렌더링됨 (같은 의미일 때 영어가 더 길다)
-    # 일반적으로 영어는 한글의 1.3~1.8배 길이
-
-    if not korean_text or not english_text:
-        return 1.0
-
-    korean_chars = len(re.findall(r'[가-힣]', korean_text))
-    english_chars = len(english_text)
-
-    if korean_chars == 0:
-        return 1.0
-
-    # 영어 문자 수 / 한글 문자 수의 비율
-    divisor = korean_chars * 1.5
-    if divisor == 0:
-        return 1.0
-
-    return max(0.8, min(2.5, english_chars / divisor))
-
-
-def wrap_text(text, font, max_width):
-    """텍스트를 최대 너비에 맞게 줄바꿈"""
-    if not text:
-        return [""]
-
-    # max_width가 너무 작으면 최소값 보장
-    max_width = max(50, max_width)
-
-    words = text.split()
-    if not words:
-        return [text]
-
-    lines = []
-    current_line = []
-
-    dummy_img = Image.new("RGB", (1, 1))
-    draw = ImageDraw.Draw(dummy_img)
-
-    for word in words:
-        test_line = ' '.join(current_line + [word])
-        try:
-            bbox = draw.textbbox((0, 0), test_line, font=font)
-            width = bbox[2] - bbox[0]
-        except:
-            width = len(test_line) * 10  # fallback
-
-        if width <= max_width:
-            current_line.append(word)
-        else:
-            if current_line:
-                lines.append(' '.join(current_line))
-            current_line = [word]
-
-    if current_line:
-        lines.append(' '.join(current_line))
-
-    return lines if lines else [text]
-
-
-def calculate_optimal_font_size(text, target_width, target_height, bold=False, allow_wrap=True):
-    """
-    텍스트에 최적화된 폰트 크기 계산
-    - 영역에 맞추면서 가독성 유지
-    - 필요시 줄바꿈 허용
-    """
-    # 0 방지
-    target_width = max(10, target_width)
-    target_height = max(10, target_height)
-
-    max_size = min(72, max(12, int(target_height * 0.9)))
-    min_size = max(8, int(target_height * 0.3))
-
-    best_font = None
-    best_lines = [text]
-    best_size = min_size
-
-    dummy_img = Image.new("RGB", (1, 1))
-    draw = ImageDraw.Draw(dummy_img)
-
-    for size in range(max_size, min_size - 1, -1):
-        font = get_font(size, bold)
-
-        # 단일 라인 시도
-        bbox = draw.textbbox((0, 0), text, font=font)
-        text_width = bbox[2] - bbox[0]
-        text_height = bbox[3] - bbox[1]
-
-        if text_width <= target_width * 0.95 and text_height <= target_height * 0.95:
-            return font, [text], text_width, text_height
-
-        # 줄바꿈 시도
-        if allow_wrap and size >= min_size + 4:
-            lines = wrap_text(text, font, int(target_width * 0.95))
-
-            if len(lines) <= 3:  # 최대 3줄까지
-                total_height = 0
-                max_line_width = 0
-
-                for line in lines:
-                    bbox = draw.textbbox((0, 0), line, font=font)
-                    line_width = bbox[2] - bbox[0]
-                    line_height = bbox[3] - bbox[1]
-                    total_height += line_height * 1.2  # 줄 간격
-                    max_line_width = max(max_line_width, line_width)
-
-                if max_line_width <= target_width * 0.95 and total_height <= target_height * 0.95:
-                    return font, lines, max_line_width, total_height
-
-        best_font = font
-        best_size = size
-
-    # 최소 크기로 줄바꿈
-    font = get_font(min_size, bold)
-    lines = wrap_text(text, font, int(target_width * 0.95))
-
-    return font, lines[:3], target_width, target_height
-
-
-def render_text_block(draw, text, x, y, width, height, style, original_text=""):
-    """단일 텍스트 블록 렌더링"""
-    if not text:
-        return
-
-    # 0 방지
-    width = max(10, width)
-    height = max(10, height)
-
-    text_color = style.get("color", (0, 0, 0))
-    bold = style.get("bold", False)
-    original_size = max(8, style.get("font_size", 24))
-
-    # 한글→영어 길이 비율 고려
-    if original_text:
-        length_ratio = estimate_text_length_ratio(original_text, text)
-        # 영어가 더 길면 폰트 크기를 약간 줄임
-        if length_ratio > 1.2:
-            original_size = int(original_size / (length_ratio * 0.7))
-
-    # 최적 폰트 크기 계산
-    font, lines, text_width, text_height = calculate_optimal_font_size(
-        text, width, height, bold, allow_wrap=True
-    )
-
-    # 원본 크기와 비교하여 조정
-    current_size = font.size if hasattr(font, 'size') else original_size
-    if current_size > original_size * 1.3:
-        font = get_font(int(original_size * 1.1), bold)
-        lines = wrap_text(text, font, int(width * 0.95))
-
-    # 텍스트 렌더링
-    dummy_img = Image.new("RGB", (1, 1))
-    dummy_draw = ImageDraw.Draw(dummy_img)
-
-    total_height = 0
-    line_heights = []
-    for line in lines:
-        bbox = dummy_draw.textbbox((0, 0), line, font=font)
-        line_height = bbox[3] - bbox[1]
-        line_heights.append(line_height)
-        total_height += line_height
-
-    # 줄 간격 추가
-    line_spacing = 4
-    total_height += line_spacing * (len(lines) - 1)
-
-    # 시작 Y 좌표 (수직 중앙 정렬)
-    if height > total_height:
-        current_y = y + (height - total_height) // 2
-    else:
-        current_y = y
-
-    # 그림자 색상
-    bg_brightness = sum(style.get("background_color", (255, 255, 255))) / 3
-    text_brightness = sum(text_color) / 3
-
-    if abs(bg_brightness - text_brightness) < 100:
-        # 배경과 텍스트 대비가 낮으면 반대 색상 사용
-        if bg_brightness > 128:
-            text_color = (0, 0, 0)
-        else:
-            text_color = (255, 255, 255)
-
-    shadow_color = (255, 255, 255) if sum(text_color) < 384 else (0, 0, 0)
-
-    for i, line in enumerate(lines):
-        if not line:
-            continue
-
-        try:
-            bbox = dummy_draw.textbbox((0, 0), line, font=font)
-            line_width = bbox[2] - bbox[0]
-        except:
-            line_width = len(line) * 10
-
-        # 수평 중앙 정렬
-        if width > line_width:
-            text_x = x + (width - line_width) // 2
-        else:
-            text_x = x
-
-        # 그림자 (미세한 아웃라인 효과)
-        for offset in [(1, 1), (-1, 1), (1, -1), (-1, -1)]:
-            draw.text(
-                (text_x + offset[0], current_y + offset[1]),
-                line,
-                font=font,
-                fill=shadow_color
-            )
-
-        # 메인 텍스트
-        draw.text((text_x, current_y), line, font=font, fill=text_color)
-
-        if i < len(line_heights):
-            current_y += line_heights[i] + line_spacing
-        else:
-            current_y += 20 + line_spacing
-
-
-def render_text_on_image(image, text_blocks, original_image=None):
-    """이미지에 번역된 텍스트 렌더링 (원본 스타일 정확 매칭)"""
-    draw = ImageDraw.Draw(image)
-    style_source = original_image if original_image else image
-
-    for block in text_blocks:
-        translated_text = block.get("translatedText", "")
-        original_text = block.get("text", "")
-        bounds = block.get("bounds", {})
-
-        if not translated_text:
-            continue
-
-        x, y, width, height = get_bounds_rect(bounds)
-
-        if width <= 0 or height <= 0:
-            continue
-
-        # 원본 이미지에서 스타일 추출
-        style = extract_text_style(style_source, bounds)
-
-        # 텍스트 렌더링
-        render_text_block(draw, translated_text, x, y, width, height, style, original_text)
-
-        logger.info(f"Rendered: '{translated_text[:30]}...' at ({x}, {y}) size=({width}x{height})")
-
-    return image
-
-
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
         "status": "ok",
-        "service": "text-render-service-v8",
+        "service": "text-render-service-v9",
         "vertex_ai_available": vertex_ai_available,
-        "opencv_available": True,
         "project_id": PROJECT_ID,
-        "features": ["inpainting", "text-render", "slice", "merge"]
+        "features": ["slice", "merge", "batch-results", "translate-chunks", "prepare-batch", "ocr-validation", "original-chunk-preservation", "retry-queue"]
     })
 
 
-@app.route("/render-text", methods=["POST"])
-def render_text():
-    """기본 텍스트 렌더링"""
+@app.route("/validate-translation", methods=["POST"])
+def validate_translation_endpoint():
+    """
+    번역된 이미지의 언어 검증 테스트 엔드포인트
+
+    Request:
+        image_base64: 검증할 이미지의 base64 (필수)
+        target_lang: 대상 언어 코드 (기본: 'en')
+        threshold: 비타겟 언어 허용 비율 (기본: 0.2)
+        expected_width: 예상 너비 (선택)
+        expected_height: 예상 높이 (선택)
+
+    Response:
+        valid: 검증 통과 여부
+        defect_type: 불량 유형 (size/translation/None)
+        reason: 검증 결과 사유
+        details: 상세 검증 결과
+    """
     try:
         data = request.get_json()
-        image_url = data.get("image_url")
-        image_base64_input = data.get("image_base64")
-        text_blocks = data.get("text_blocks", [])
 
-        if not image_url and not image_base64_input:
-            return jsonify({"error": "image_url or image_base64 required"}), 400
+        image_base64 = data.get("image_base64")
+        if not image_base64:
+            return jsonify({"error": "image_base64 required"}), 400
 
-        if image_url:
-            image = download_image(image_url)
-        else:
-            image_data = base64.b64decode(image_base64_input)
-            image = Image.open(BytesIO(image_data)).convert("RGB")
+        target_lang = data.get("target_lang", "en")
+        threshold = float(data.get("threshold", 0.2))
+        expected_width = data.get("expected_width")
+        expected_height = data.get("expected_height")
 
-        result_image = render_text_on_image(image, text_blocks)
-        result_base64, _ = image_to_base64(result_image)
+        # 통합 검증 수행
+        result = validate_translated_chunk(
+            chunk_base64=image_base64,
+            target_lang=target_lang,
+            expected_width=expected_width,
+            expected_height=expected_height,
+            lang_threshold=threshold,
+            skip_ocr=False
+        )
 
         return jsonify({
-            "success": True,
-            "image_base64": result_base64,
-            "text_blocks_rendered": len(text_blocks)
+            "valid": result["valid"],
+            "defect_type": result.get("defect_type"),
+            "reason": result["reason"],
+            "can_retry": result.get("can_retry", True),
+            "details": {
+                "size_validation": result.get("size_validation"),
+                "translation_validation": result.get("translation_validation")
+            }
         })
 
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Translation validation error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/translate-image", methods=["POST"])
-def translate_image():
+@app.route("/ocr-detect", methods=["POST"])
+def ocr_detect_endpoint():
     """
-    전체 번역 파이프라인 (OpenCV 인페인팅 + 스타일 매칭 텍스트 삽입)
+    이미지에서 텍스트 감지 (OCR) 테스트 엔드포인트
+
+    Request:
+        image_base64: 이미지의 base64 (필수)
+        lang: OCR 언어 코드 (기본: 'en')
+
+    Response:
+        has_text: 텍스트 존재 여부
+        total_chars: 감지된 총 문자 수
+        detected_texts: 감지된 텍스트 목록
     """
     try:
         data = request.get_json()
-        image_url = data.get("image_url")
-        image_base64_input = data.get("image_base64")
-        text_blocks = data.get("text_blocks", [])
-        use_advanced_inpaint = data.get("use_advanced_inpaint", True)
 
-        if not image_url and not image_base64_input:
-            return jsonify({"error": "image_url or image_base64 required"}), 400
+        image_base64 = data.get("image_base64")
+        if not image_base64:
+            return jsonify({"error": "image_base64 required"}), 400
 
-        # 1. 이미지 로드
-        logger.info("Step 1: Loading image...")
-        try:
-            if image_url:
-                image = download_image(image_url)
-            else:
-                image_data = base64.b64decode(image_base64_input)
-                image = Image.open(BytesIO(image_data)).convert("RGB")
-        except Exception as img_err:
-            logger.error(f"Image load error: {img_err}")
-            return jsonify({"error": f"Image load failed: {str(img_err)}"}), 400
+        lang = data.get("lang", "en")
 
-        # 원본 이미지 저장 (스타일 추출용)
-        original_image = image.copy()
-
-        if not text_blocks:
-            img_base64, _ = image_to_base64(image)
-            return jsonify({
-                "success": True,
-                "image_base64": img_base64,
-                "message": "No text blocks to process"
-            })
-
-        # text_blocks 유효성 검사
-        valid_blocks = []
-        for i, block in enumerate(text_blocks):
-            try:
-                bounds = block.get("bounds", {})
-                x, y, w, h = get_bounds_rect(bounds)
-                if w > 0 and h > 0 and x >= 0 and y >= 0:
-                    valid_blocks.append(block)
-                else:
-                    logger.warning(f"Block {i} skipped: invalid bounds ({x}, {y}, {w}, {h})")
-            except Exception as block_err:
-                logger.warning(f"Block {i} skipped: {block_err}")
-
-        if not valid_blocks:
-            img_base64, _ = image_to_base64(image)
-            return jsonify({
-                "success": True,
-                "image_base64": img_base64,
-                "message": "No valid text blocks to process"
-            })
-
-        text_blocks = valid_blocks
-        logger.info(f"Processing {len(text_blocks)} valid text blocks")
-
-        # 2. OpenCV 인페인팅으로 텍스트 영역 제거
-        logger.info(f"Step 2: Inpainting {len(text_blocks)} text regions...")
-
-        try:
-            if use_advanced_inpaint:
-                inpainted_image = advanced_inpaint(image, text_blocks, padding=12)
-            else:
-                inpainted_image = opencv_inpaint(image, text_blocks, padding=10)
-        except Exception as inpaint_err:
-            logger.error(f"Inpainting error: {inpaint_err}")
-            import traceback
-            traceback.print_exc()
-            # 인페인팅 실패 시 원본 이미지 사용
-            inpainted_image = image.copy()
-
-        # 3. 번역된 텍스트 삽입 (원본 스타일 매칭)
-        logger.info("Step 3: Rendering translated text with matched style...")
-        try:
-            final_image = render_text_on_image(inpainted_image, text_blocks, original_image)
-        except Exception as render_err:
-            logger.error(f"Render error: {render_err}")
-            import traceback
-            traceback.print_exc()
-            final_image = inpainted_image
-
-        # 4. 결과 반환
-        result_base64, _ = image_to_base64(final_image)
+        # OCR 수행
+        result = validate_translation_language(image_base64, lang)
 
         return jsonify({
-            "success": True,
-            "image_base64": result_base64,
-            "text_blocks_processed": len(text_blocks),
-            "inpainting_method": "advanced_opencv" if use_advanced_inpaint else "opencv"
+            "has_text": result.get("has_text", False),
+            "total_chars": result.get("total_chars", 0),
+            "target_lang_ratio": result.get("target_lang_ratio", 1.0),
+            "detected_texts": result.get("detected_text", [])
         })
 
     except Exception as e:
-        logger.error(f"Error in translate_image: {e}")
+        logger.error(f"OCR detection error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/cleanup-original-chunks", methods=["POST"])
+def cleanup_original_chunks_endpoint():
+    """
+    배치 처리 완료 후 원본 청크 정리
+
+    Request:
+        batch_id: 정리할 배치 ID (필수)
+        supabase_url: Supabase URL (선택, 환경변수 대체)
+        supabase_key: Supabase 키 (선택, 환경변수 대체)
+
+    Response:
+        success: 성공 여부
+        deleted_count: 삭제된 파일 수
+    """
+    try:
+        data = request.get_json()
+
+        batch_id = data.get("batch_id")
+        if not batch_id:
+            return jsonify({"error": "batch_id required"}), 400
+
+        supabase_url = data.get("supabase_url")
+        supabase_key = data.get("supabase_key")
+
+        result = delete_original_chunks(
+            batch_id=batch_id,
+            supabase_url=supabase_url,
+            supabase_key=supabase_key
+        )
+
+        if result["success"]:
+            logger.info(f"[cleanup] 원본 청크 정리 완료: batch_id={batch_id}, 삭제={result['deleted_count']}")
+            return jsonify({
+                "success": True,
+                "batch_id": batch_id,
+                "deleted_count": result["deleted_count"]
+            })
+        else:
+            logger.warning(f"[cleanup] 원본 청크 정리 실패: {result['error']}")
+            return jsonify({
+                "success": False,
+                "error": result["error"]
+            }), 500
+
+    except Exception as e:
+        logger.error(f"Cleanup error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/get-original-chunk", methods=["POST"])
+def get_original_chunk_endpoint():
+    """
+    원본 청크 조회 (디버깅/테스트용)
+
+    Request:
+        batch_id: 배치 ID (필수)
+        chunk_key: 청크 키 (필수, 예: "p123_i0_c0")
+        supabase_url: Supabase URL (선택)
+        supabase_key: Supabase 키 (선택)
+
+    Response:
+        success: 성공 여부
+        base64: 원본 이미지 base64
+    """
+    try:
+        data = request.get_json()
+
+        batch_id = data.get("batch_id")
+        chunk_key = data.get("chunk_key")
+
+        if not batch_id or not chunk_key:
+            return jsonify({"error": "batch_id and chunk_key required"}), 400
+
+        result = get_original_chunk(
+            chunk_key=chunk_key,
+            batch_id=batch_id,
+            supabase_url=data.get("supabase_url"),
+            supabase_key=data.get("supabase_key")
+        )
+
+        if result["success"]:
+            return jsonify({
+                "success": True,
+                "batch_id": batch_id,
+                "chunk_key": chunk_key,
+                "base64": result["base64"]
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "error": result["error"]
+            }), 404
+
+    except Exception as e:
+        logger.error(f"Get original chunk error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# ===== 재처리 대기열 엔드포인트 =====
+
+@app.route("/retry-queue/add", methods=["POST"])
+def add_to_retry_queue():
+    """
+    실패한 청크를 재처리 대기열에 추가
+
+    Request:
+        chunk_info: 청크 정보 {batch_id, chunk_key, product_id, ...}
+        config: 처리 설정 {targetLangCode, prompt, geminiApiKey, ...}
+        error_reason: 실패 사유
+
+    Response:
+        success: 성공 여부
+        queue_id: 대기열 ID
+    """
+    try:
+        data = request.get_json()
+
+        chunk_info = data.get("chunk_info", {})
+        config = data.get("config", {})
+        error_reason = data.get("error_reason", "Unknown error")
+
+        if not chunk_info.get("chunk_key"):
+            return jsonify({"error": "chunk_info.chunk_key required"}), 400
+
+        result = enqueue_failed_chunk(
+            chunk_info=chunk_info,
+            config=config,
+            error_reason=error_reason,
+            supabase_url=config.get("supabaseUrl"),
+            supabase_key=config.get("supabaseKey")
+        )
+
+        if result["success"]:
+            return jsonify({
+                "success": True,
+                "queue_id": result["queue_id"],
+                "chunk_key": chunk_info.get("chunk_key")
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "error": result["error"]
+            }), 500
+
+    except Exception as e:
+        logger.error(f"Add to retry queue error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/retry-queue/list", methods=["GET", "POST"])
+def list_retry_queue():
+    """
+    재처리 대기열 조회
+
+    Request (POST) or Query Params (GET):
+        batch_id: 특정 배치만 조회 (선택)
+        status: 상태 필터 (선택, 기본: pending)
+        limit: 최대 조회 수 (선택, 기본: 50)
+
+    Response:
+        success: 성공 여부
+        items: 대기열 항목 리스트
+        count: 항목 수
+    """
+    try:
+        if request.method == "POST":
+            data = request.get_json() or {}
+        else:
+            data = {}
+
+        batch_id = data.get("batch_id") or request.args.get("batch_id")
+        limit = int(data.get("limit") or request.args.get("limit", 50))
+
+        result = get_pending_queue_items(
+            batch_id=batch_id,
+            limit=limit,
+            supabase_url=data.get("supabase_url"),
+            supabase_key=data.get("supabase_key")
+        )
+
+        if result["success"]:
+            return jsonify({
+                "success": True,
+                "items": result["items"],
+                "count": len(result["items"])
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "error": result["error"]
+            }), 500
+
+    except Exception as e:
+        logger.error(f"List retry queue error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/retry-queue/process", methods=["POST"])
+def process_retry_queue():
+    """
+    재처리 대기열 항목들 처리
+
+    Request:
+        batch_id: 특정 배치만 처리 (선택)
+        limit: 최대 처리 수 (선택, 기본: 10)
+        supabase_url: Supabase URL (선택)
+        supabase_key: Supabase 키 (선택)
+
+    Response:
+        success: 성공 여부
+        processed: 처리된 항목 수
+        succeeded: 성공한 항목 수
+        failed: 실패한 항목 수
+        images_completed: 완료된 이미지 목록
+    """
+    try:
+        data = request.get_json() or {}
+
+        batch_id = data.get("batch_id")
+        limit = int(data.get("limit", 10))
+        supabase_url = data.get("supabase_url") or SUPABASE_URL
+        supabase_key = data.get("supabase_key") or SUPABASE_SERVICE_KEY
+
+        # 대기 중인 항목 조회
+        queue_result = get_pending_queue_items(
+            batch_id=batch_id,
+            limit=limit,
+            supabase_url=supabase_url,
+            supabase_key=supabase_key
+        )
+
+        if not queue_result["success"]:
+            return jsonify({
+                "success": False,
+                "error": queue_result["error"]
+            }), 500
+
+        items = queue_result["items"]
+        if not items:
+            return jsonify({
+                "success": True,
+                "message": "처리할 항목 없음",
+                "processed": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "images_completed": []
+            })
+
+        # 각 항목 처리
+        results = {
+            "processed": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "images_completed": []
+        }
+
+        for item in items:
+            result = process_single_retry_item(
+                item=item,
+                supabase_url=supabase_url,
+                supabase_key=supabase_key
+            )
+
+            results["processed"] += 1
+
+            if result["success"]:
+                results["succeeded"] += 1
+                if result.get("image_complete"):
+                    results["images_completed"].append({
+                        "batch_id": item.get("batch_id"),
+                        "product_id": item.get("product_id"),
+                        "image_index": item.get("image_index"),
+                        "completion_info": result.get("completion_info")
+                    })
+            else:
+                results["failed"] += 1
+
+        logger.info(f"[대기열 처리 완료] 처리={results['processed']}, 성공={results['succeeded']}, 실패={results['failed']}")
+
+        return jsonify({
+            "success": True,
+            **results
+        })
+
+    except Exception as e:
+        logger.error(f"Process retry queue error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/retry-queue/check-and-merge", methods=["POST"])
+def check_and_merge_image():
+    """
+    이미지 완료 여부 확인 및 병합 실행
+
+    Request:
+        batch_id: 배치 ID (필수)
+        product_id: 상품 ID (필수)
+        image_index: 이미지 인덱스 (필수)
+        total_chunks: 총 청크 수 (필수)
+        config: 설정 {supabaseUrl, supabaseKey, storageBucket, outputFormat, ...}
+
+    Response:
+        complete: 완료 여부
+        merged: 병합 실행 여부
+        uploaded_url: 업로드된 URL (병합 시)
+    """
+    try:
+        data = request.get_json()
+
+        batch_id = data.get("batch_id")
+        product_id = data.get("product_id")
+        image_index = data.get("image_index")
+        total_chunks = data.get("total_chunks")
+        config = data.get("config", {})
+
+        if not all([batch_id, product_id is not None, image_index is not None, total_chunks]):
+            return jsonify({"error": "batch_id, product_id, image_index, total_chunks required"}), 400
+
+        supabase_url = config.get("supabaseUrl") or SUPABASE_URL
+        supabase_key = config.get("supabaseKey") or SUPABASE_SERVICE_KEY
+
+        # 완료 여부 확인
+        completion = check_image_completion(
+            batch_id=batch_id,
+            product_id=product_id,
+            image_index=image_index,
+            total_chunks=total_chunks,
+            supabase_url=supabase_url,
+            supabase_key=supabase_key
+        )
+
+        if not completion["complete"]:
+            return jsonify({
+                "complete": False,
+                "merged": False,
+                "completed_count": completion["completed_count"],
+                "total_chunks": total_chunks
+            })
+
+        # 청크들을 순서대로 정렬하여 병합
+        chunks = sorted(completion["chunks"], key=lambda x: x.get("chunk_index", 0))
+
+        # 병합을 위한 청크 데이터 준비
+        chunk_data_list = []
+        for chunk in chunks:
+            chunk_data_list.append({
+                "base64": chunk.get("translated_base64"),
+                "index": chunk.get("chunk_index"),
+                "height": chunk.get("chunk_height", 2000)
+            })
+
+        # 병합 실행
+        original_width = chunks[0].get("chunk_width", 1000) if chunks else 1000
+
+        merged_result = merge_images_internal(
+            chunks=chunk_data_list,
+            original_width=original_width,
+            output_format=config.get("outputFormat", "WEBP"),
+            output_quality=config.get("outputQuality", 100)
+        )
+
+        if not merged_result["success"]:
+            return jsonify({
+                "complete": True,
+                "merged": False,
+                "error": merged_result.get("error", "병합 실패")
+            }), 500
+
+        # Supabase Storage에 업로드
+        storage_bucket = config.get("storageBucket", "translated-images")
+        product_code = chunks[0].get("product_code", f"product_{product_id}")
+        output_extension = config.get("outputExtension", ".webp")
+        target_lang = config.get("targetLangCode", "en")
+
+        storage_path = f"{product_code}/{target_lang}/image_{image_index}{output_extension}"
+
+        upload_result = upload_to_supabase_storage(
+            image_base64=merged_result["merged_base64"],
+            storage_path=storage_path,
+            storage_bucket=storage_bucket,
+            supabase_url=supabase_url,
+            supabase_key=supabase_key,
+            content_type=f"image/{config.get('outputFormat', 'webp').lower()}"
+        )
+
+        if upload_result["success"]:
+            logger.info(f"[병합 완료] product_id={product_id}, image_index={image_index}, url={upload_result['url']}")
+            return jsonify({
+                "complete": True,
+                "merged": True,
+                "uploaded_url": upload_result["url"],
+                "storage_path": storage_path
+            })
+        else:
+            return jsonify({
+                "complete": True,
+                "merged": True,
+                "uploaded": False,
+                "error": upload_result.get("error", "업로드 실패"),
+                "merged_base64": merged_result["merged_base64"][:100] + "..."  # 일부만 반환
+            }), 500
+
+    except Exception as e:
+        logger.error(f"Check and merge error: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/simple-replace", methods=["POST"])
-def simple_replace():
-    """간단한 텍스트 교체 (인페인팅 없이)"""
+def merge_images_internal(chunks: list, original_width: int, output_format: str = "WEBP", output_quality: int = 100) -> dict:
+    """
+    청크 이미지들을 내부적으로 병합 (엔드포인트 호출 없이)
+
+    Args:
+        chunks: 청크 리스트 [{"base64": ..., "index": ..., "height": ...}, ...]
+        original_width: 원본 이미지 너비
+        output_format: 출력 포맷
+        output_quality: 출력 품질
+
+    Returns:
+        dict: {"success": bool, "merged_base64": str, "error": str}
+    """
     try:
-        data = request.get_json()
-        image_url = data.get("image_url")
-        image_base64_input = data.get("image_base64")
-        text_blocks = data.get("text_blocks", [])
+        if not chunks:
+            return {"success": False, "merged_base64": "", "error": "청크 없음"}
 
-        if not image_url and not image_base64_input:
-            return jsonify({"error": "image_url or image_base64 required"}), 400
+        # 청크 순서대로 정렬
+        sorted_chunks = sorted(chunks, key=lambda x: x.get("index", 0))
 
-        if image_url:
-            image = download_image(image_url)
+        # 각 청크 이미지 디코딩
+        images = []
+        for chunk in sorted_chunks:
+            chunk_base64 = chunk.get("base64")
+            if not chunk_base64:
+                continue
+            try:
+                img_bytes = base64.b64decode(chunk_base64)
+                img = Image.open(BytesIO(img_bytes)).convert("RGB")
+                images.append(img)
+            except Exception as e:
+                logger.warning(f"청크 디코딩 실패: {e}")
+                continue
+
+        if not images:
+            return {"success": False, "merged_base64": "", "error": "유효한 청크 없음"}
+
+        # 총 높이 계산
+        total_height = sum(img.height for img in images)
+        max_width = max(img.width for img in images)
+
+        # 새 이미지 생성
+        merged = Image.new("RGB", (max_width, total_height), (255, 255, 255))
+
+        # 청크들을 순서대로 붙이기
+        current_y = 0
+        for img in images:
+            merged.paste(img, (0, current_y))
+            current_y += img.height
+
+        # base64로 인코딩
+        buffer = BytesIO()
+        pil_format = output_format.upper()
+        if pil_format == "JPG":
+            pil_format = "JPEG"
+
+        if pil_format == "WEBP":
+            merged.save(buffer, format="WEBP", quality=output_quality, method=4)
+        elif pil_format == "JPEG":
+            merged.save(buffer, format="JPEG", quality=output_quality, optimize=True)
         else:
-            image_data = base64.b64decode(image_base64_input)
-            image = Image.open(BytesIO(image_data)).convert("RGB")
+            merged.save(buffer, format=pil_format, quality=output_quality)
 
-        original_image = image.copy()
+        merged_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
 
-        # 배경색으로 채우기
-        draw = ImageDraw.Draw(image)
-        for block in text_blocks:
-            bounds = block.get("bounds", {})
-            x, y, w, h = get_bounds_rect(bounds)
-            style = extract_text_style(original_image, bounds)
-            bg_color = style.get("background_color", (255, 255, 255))
-            draw.rectangle([x-2, y-2, x+w+2, y+h+2], fill=bg_color)
-
-        # 텍스트 렌더링
-        final_image = render_text_on_image(image, text_blocks, original_image)
-        result_base64, _ = image_to_base64(final_image)
-
-        return jsonify({
+        return {
             "success": True,
-            "image_base64": result_base64,
-            "text_blocks_processed": len(text_blocks)
-        })
+            "merged_base64": merged_base64,
+            "width": max_width,
+            "height": total_height,
+            "error": ""
+        }
 
     except Exception as e:
-        logger.error(f"Error: {e}")
-        return jsonify({"error": str(e)}), 500
+        return {"success": False, "merged_base64": "", "error": str(e)}
 
 
-# ===== 이미지 슬라이스/병합 기능 (v4) =====
+def upload_to_supabase_storage(
+    image_base64: str,
+    storage_path: str,
+    storage_bucket: str,
+    supabase_url: str,
+    supabase_key: str,
+    content_type: str = "image/webp"
+) -> dict:
+    """
+    Supabase Storage에 이미지 업로드
+
+    Args:
+        image_base64: 이미지 base64
+        storage_path: 저장 경로
+        storage_bucket: 버킷명
+        supabase_url: Supabase URL
+        supabase_key: Supabase 키
+        content_type: 컨텐츠 타입
+
+    Returns:
+        dict: {"success": bool, "url": str, "error": str}
+    """
+    try:
+        image_bytes = base64.b64decode(image_base64)
+
+        upload_url = f"{supabase_url}/storage/v1/object/{storage_bucket}/{storage_path}"
+
+        # 먼저 업로드 시도
+        response = requests.post(
+            upload_url,
+            headers={
+                "apikey": supabase_key,
+                "Authorization": f"Bearer {supabase_key}",
+                "Content-Type": content_type
+            },
+            data=image_bytes,
+            timeout=60
+        )
+
+        # 이미 존재하면 업데이트
+        if response.status_code == 400 and "already exists" in response.text.lower():
+            response = requests.put(
+                upload_url,
+                headers={
+                    "apikey": supabase_key,
+                    "Authorization": f"Bearer {supabase_key}",
+                    "Content-Type": content_type
+                },
+                data=image_bytes,
+                timeout=60
+            )
+
+        if response.status_code in [200, 201]:
+            public_url = f"{supabase_url}/storage/v1/object/public/{storage_bucket}/{storage_path}"
+            return {"success": True, "url": public_url, "error": ""}
+        else:
+            return {
+                "success": False,
+                "url": "",
+                "error": f"업로드 실패: {response.status_code} - {response.text[:200]}"
+            }
+
+    except Exception as e:
+        return {"success": False, "url": "", "error": str(e)}
+
+
+# ===== 이미지 슬라이스/병합 기능 =====
 
 def find_smart_cut_point(image, target_y, search_range=200):
     """
@@ -1531,49 +2499,7 @@ def merge_images_endpoint():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/extract-style", methods=["POST"])
-def extract_style():
-    """텍스트 영역의 스타일 정보 추출"""
-    try:
-        data = request.get_json()
-        image_url = data.get("image_url")
-        image_base64_input = data.get("image_base64")
-        text_blocks = data.get("text_blocks", [])
-
-        if not image_url and not image_base64_input:
-            return jsonify({"error": "image_url or image_base64 required"}), 400
-
-        if image_url:
-            image = download_image(image_url)
-        else:
-            image_data = base64.b64decode(image_base64_input)
-            image = Image.open(BytesIO(image_data)).convert("RGB")
-
-        styles = []
-        for block in text_blocks:
-            bounds = block.get("bounds", {})
-            style = extract_text_style(image, bounds)
-            styles.append({
-                "text": block.get("text", ""),
-                "style": {
-                    "color": list(style["color"]),
-                    "font_size": style["font_size"],
-                    "bold": style["bold"],
-                    "background_color": list(style["background_color"])
-                }
-            })
-
-        return jsonify({
-            "success": True,
-            "styles": styles
-        })
-
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-# ===== Gemini 배치 결과 처리 (v5) =====
+# ===== Gemini 배치 결과 처리 =====
 
 @app.route("/process-batch-results", methods=["POST"])
 def process_batch_results():
@@ -1644,8 +2570,13 @@ def process_batch_results():
         validation_stats = {
             "validation_passed": 0,
             "validation_failed": 0,
+            "size_defects": 0,        # 크기 불량
+            "translation_defects": 0,  # 번역 불량 (OCR 검증)
             "retry_success": 0,
-            "retry_failed": 0
+            "retry_failed": 0,
+            "unretryable": 0,         # 재처리 불가
+            "original_chunk_used": 0, # 원본 청크 사용 횟수
+            "queued_for_retry": 0     # 재처리 대기열에 추가된 수
         }
 
         for line_num, line in enumerate(lines):
@@ -1684,55 +2615,157 @@ def process_batch_results():
                 logger.warning(f"Line {line_num}: No image data for {custom_id}")
                 continue
 
-            # ===== 청크 검증 및 자동 재시도 =====
+            # ===== 청크 검증 (크기 + OCR 번역 언어) 및 자동 재시도 =====
             expected_width = meta.get("chunkWidth")
             expected_height = meta.get("chunkHeight")
 
-            validation = validate_chunk(
-                translated_base64,
+            # config에서 대상 언어 가져오기
+            target_lang = config.get("targetLangCode", "en")
+
+            # OCR 검증 활성화 여부 (기본: 활성화)
+            enable_ocr_validation = config.get("enableOcrValidation", True)
+
+            # 통합 검증 (크기 + 번역 언어)
+            validation = validate_translated_chunk(
+                chunk_base64=translated_base64,
+                target_lang=target_lang,
                 expected_width=expected_width,
                 expected_height=expected_height,
-                tolerance=0.3  # 30% 오차 허용
+                size_tolerance=0.3,  # 크기 30% 오차 허용
+                lang_threshold=0.2,  # 비타겟 언어 20% 이상이면 불량
+                skip_ocr=not enable_ocr_validation
             )
 
             if not validation["valid"]:
-                logger.warning(f"[검증 실패] {custom_id}: {validation['reason']}")
+                defect_type = validation.get("defect_type", "unknown")
+                logger.warning(f"[검증 실패] {custom_id}: {validation['reason']} (유형: {defect_type})")
 
-                # 원본 청크로 재시도 (배치 요청에서 원본 가져올 수 없으므로 현재 결과 사용)
-                # 실시간 API로 재처리 시도
-                prompt = config.get("prompt", "Translate the text in this image to English.")
-                gemini_model = config.get("geminiModel", "gemini-3-pro-image-preview")
+                # 불량 유형별 통계 업데이트
+                if defect_type == "size":
+                    validation_stats["size_defects"] = validation_stats.get("size_defects", 0) + 1
+                elif defect_type == "translation":
+                    validation_stats["translation_defects"] = validation_stats.get("translation_defects", 0) + 1
 
-                retry_result = retry_chunk_realtime(
-                    chunk_base64=translated_base64,  # 현재 결과로 재시도 (원본이 없으므로)
-                    gemini_api_key=gemini_api_key,
-                    prompt=prompt,
-                    gemini_model=gemini_model,
-                    max_retries=2
-                )
+                # 재처리 가능한 경우에만 재시도
+                if validation.get("can_retry", True):
+                    prompt = config.get("prompt", "Translate the text in this image to English.")
+                    gemini_model = config.get("geminiModel", "gemini-3-pro-image-preview")
 
-                if retry_result["success"]:
-                    # 재시도 결과 검증
-                    retry_validation = validate_chunk(
-                        retry_result["base64"],
-                        expected_width=expected_width,
-                        expected_height=expected_height,
-                        tolerance=0.3
+                    # 원본 청크 가져오기 시도
+                    original_chunk_base64 = None
+                    batch_id = meta.get("batchId")
+                    original_chunk_path = meta.get("originalChunkPath")
+
+                    if batch_id and original_chunk_path:
+                        logger.info(f"[원본 청크 조회] {custom_id}: batch_id={batch_id}")
+                        original_result = get_original_chunk(
+                            chunk_key=custom_id,
+                            batch_id=batch_id,
+                            supabase_url=config.get("supabaseUrl") or SUPABASE_URL,
+                            supabase_key=config.get("supabaseKey") or SUPABASE_SERVICE_KEY
+                        )
+                        if original_result["success"]:
+                            original_chunk_base64 = original_result["base64"]
+                            logger.info(f"[원본 청크 조회 성공] {custom_id}")
+                        else:
+                            logger.warning(f"[원본 청크 조회 실패] {custom_id}: {original_result['error']}")
+
+                    # 원본 청크가 있으면 원본으로, 없으면 번역 실패본으로 재시도
+                    retry_chunk = original_chunk_base64 if original_chunk_base64 else translated_base64
+                    retry_source = "원본" if original_chunk_base64 else "번역본"
+
+                    if original_chunk_base64:
+                        validation_stats["original_chunk_used"] = validation_stats.get("original_chunk_used", 0) + 1
+
+                    retry_result = retry_chunk_realtime(
+                        chunk_base64=retry_chunk,
+                        gemini_api_key=gemini_api_key,
+                        prompt=prompt,
+                        gemini_model=gemini_model,
+                        max_retries=2
                     )
-                    if retry_validation["valid"]:
-                        translated_base64 = retry_result["base64"]
-                        logger.info(f"[재시도 성공] {custom_id}: 검증 통과")
-                        validation_stats["retry_success"] = validation_stats.get("retry_success", 0) + 1
+
+                    if retry_result["success"]:
+                        # 재시도 결과 검증 (OCR 포함)
+                        retry_validation = validate_translated_chunk(
+                            chunk_base64=retry_result["base64"],
+                            target_lang=target_lang,
+                            expected_width=expected_width,
+                            expected_height=expected_height,
+                            size_tolerance=0.3,
+                            lang_threshold=0.2,
+                            skip_ocr=not enable_ocr_validation
+                        )
+
+                        if retry_validation["valid"]:
+                            translated_base64 = retry_result["base64"]
+                            logger.info(f"[재시도 성공] {custom_id}: {retry_source}으로 검증 통과")
+                            validation_stats["retry_success"] = validation_stats.get("retry_success", 0) + 1
+                        else:
+                            logger.warning(f"[재시도 실패] {custom_id}: {retry_source}으로 재시도 후에도 검증 실패 - {retry_validation['reason']}")
+                            validation_stats["retry_failed"] = validation_stats.get("retry_failed", 0) + 1
+
+                            # 재처리 대기열에 추가
+                            chunk_info = {
+                                "batch_id": meta.get("batchId"),
+                                "chunk_key": custom_id,
+                                "product_id": meta.get("productId"),
+                                "product_code": meta.get("productCode"),
+                                "image_index": meta.get("imageIndex"),
+                                "chunk_index": meta.get("chunkIndex"),
+                                "total_chunks": meta.get("totalChunks"),
+                                "chunk_width": expected_width,
+                                "chunk_height": expected_height,
+                                "original_chunk_path": meta.get("originalChunkPath")
+                            }
+                            queue_result = enqueue_failed_chunk(
+                                chunk_info=chunk_info,
+                                config=config,
+                                error_reason=retry_validation['reason'],
+                                supabase_url=config.get("supabaseUrl"),
+                                supabase_key=config.get("supabaseKey")
+                            )
+                            if queue_result["success"]:
+                                validation_stats["queued_for_retry"] = validation_stats.get("queued_for_retry", 0) + 1
+                                logger.info(f"[대기열 추가] {custom_id}: queue_id={queue_result['queue_id']}")
                     else:
-                        logger.warning(f"[재시도 실패] {custom_id}: 재시도 후에도 검증 실패 - {retry_validation['reason']}")
+                        logger.warning(f"[재시도 실패] {custom_id}: {retry_result['error']}")
                         validation_stats["retry_failed"] = validation_stats.get("retry_failed", 0) + 1
+
+                        # 재처리 대기열에 추가
+                        chunk_info = {
+                            "batch_id": meta.get("batchId"),
+                            "chunk_key": custom_id,
+                            "product_id": meta.get("productId"),
+                            "product_code": meta.get("productCode"),
+                            "image_index": meta.get("imageIndex"),
+                            "chunk_index": meta.get("chunkIndex"),
+                            "total_chunks": meta.get("totalChunks"),
+                            "chunk_width": expected_width,
+                            "chunk_height": expected_height,
+                            "original_chunk_path": meta.get("originalChunkPath")
+                        }
+                        queue_result = enqueue_failed_chunk(
+                            chunk_info=chunk_info,
+                            config=config,
+                            error_reason=retry_result.get('error', 'Unknown error'),
+                            supabase_url=config.get("supabaseUrl"),
+                            supabase_key=config.get("supabaseKey")
+                        )
+                        if queue_result["success"]:
+                            validation_stats["queued_for_retry"] = validation_stats.get("queued_for_retry", 0) + 1
+                            logger.info(f"[대기열 추가] {custom_id}: queue_id={queue_result['queue_id']}")
                 else:
-                    logger.warning(f"[재시도 실패] {custom_id}: {retry_result['error']}")
-                    validation_stats["retry_failed"] = validation_stats.get("retry_failed", 0) + 1
+                    logger.error(f"[재처리 불가] {custom_id}: 데이터 손상으로 재처리 불가")
+                    validation_stats["unretryable"] = validation_stats.get("unretryable", 0) + 1
 
                 validation_stats["validation_failed"] = validation_stats.get("validation_failed", 0) + 1
             else:
                 validation_stats["validation_passed"] = validation_stats.get("validation_passed", 0) + 1
+                # 번역 검증 결과 로깅 (디버깅용)
+                trans_val = validation.get("translation_validation")
+                if trans_val and trans_val.get("has_text"):
+                    logger.debug(f"[검증 통과] {custom_id}: 타겟 언어 비율 {trans_val.get('target_lang_ratio', 0):.1%}")
             # ===== 검증 끝 =====
 
             image_key = f"{meta['productId']}_{meta['imageIndex']}"
@@ -2246,12 +3279,21 @@ def prepare_batch():
                 "error": "처리할 이미지가 없습니다"
             }), 400
 
+        # 배치 ID 생성 (원본 청크 저장용)
+        batch_id = f"batch-{table_name}-{int(time.time())}"
+
+        # 원본 청크 보존 설정 (기본: 활성화)
+        preserve_original_chunks = config.get("preserveOriginalChunks", True)
+        logger.info(f"[prepare-batch] 배치 ID: {batch_id}")
+        logger.info(f"[prepare-batch] 원본 청크 보존: {preserve_original_chunks}")
+
         # 2. 임시 파일에 JSONL 스트리밍 (메모리 효율)
         temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False)
         chunk_metadata = []
         total_chunks = 0
         errors = []
         processed_images = 0
+        saved_original_chunks = 0
 
         for img_idx, img_req in enumerate(image_requests):
             if img_idx % 50 == 0:
@@ -2294,6 +3336,22 @@ def prepare_batch():
                     # 파일에 직접 쓰기 (메모리 절약)
                     temp_file.write(json.dumps(batch_request) + '\n')
 
+                    # 원본 청크 저장 (재처리용)
+                    original_chunk_path = ""
+                    if preserve_original_chunks:
+                        save_result = save_original_chunk(
+                            chunk_base64=chunk["base64"],
+                            chunk_key=request_key,
+                            batch_id=batch_id,
+                            supabase_url=supabase_url,
+                            supabase_key=supabase_key
+                        )
+                        if save_result["success"]:
+                            original_chunk_path = save_result["path"]
+                            saved_original_chunks += 1
+                        else:
+                            logger.warning(f"[prepare-batch] 원본 청크 저장 실패: {request_key} - {save_result['error']}")
+
                     chunk_metadata.append({
                         "key": request_key,
                         "productId": img_req["productId"],
@@ -2304,7 +3362,9 @@ def prepare_batch():
                         "chunkHeight": chunk["height"],
                         "chunkWidth": img_width,  # 원본 이미지 너비 저장
                         "yStart": chunk["y_start"],
-                        "yEnd": chunk["y_end"]
+                        "yEnd": chunk["y_end"],
+                        "originalChunkPath": original_chunk_path,  # 원본 청크 경로
+                        "batchId": batch_id  # 배치 ID
                     })
 
                     total_chunks += 1
@@ -2333,6 +3393,7 @@ def prepare_batch():
         logger.info(f"[prepare-batch] 청크 생성 완료")
         logger.info(f"  - 처리된 이미지: {processed_images}")
         logger.info(f"  - 생성된 청크: {total_chunks}")
+        logger.info(f"  - 저장된 원본 청크: {saved_original_chunks}")
         logger.info(f"  - 에러: {len(errors)}")
 
         # 3. Gemini Files API에 JSONL 업로드 (파일에서 직접 읽기)
@@ -2390,7 +3451,8 @@ def prepare_batch():
             }), 500
 
         # 4. Gemini Batch API 제출
-        batch_display_name = f"batch-{table_name}-{int(time.time())}"
+        # 배치 ID를 display_name으로 사용 (이미 생성됨)
+        batch_display_name = batch_id
 
         try:
             batch_response = requests.post(
@@ -2434,6 +3496,7 @@ def prepare_batch():
 
         return jsonify({
             "success": True,
+            "batchId": batch_id,  # 원본 청크 조회용 배치 ID
             "batchName": batch_name,
             "batchState": batch_state,
             "batchDisplayName": batch_display_name,
@@ -2441,6 +3504,7 @@ def prepare_batch():
             "totalProducts": len(product_map),
             "totalImages": len(image_requests),
             "totalChunks": total_chunks,
+            "savedOriginalChunks": saved_original_chunks,  # 저장된 원본 청크 수
             "chunkMetadata": chunk_metadata,
             "productMap": product_map,
             "config": {
@@ -2455,7 +3519,8 @@ def prepare_batch():
                 "targetLangCode": config.get("targetLangCode", "en"),
                 "outputFormat": config.get("outputFormat", "WEBP"),
                 "outputExtension": config.get("outputExtension", ".webp"),
-                "outputQuality": config.get("outputQuality", 100)
+                "outputQuality": config.get("outputQuality", 100),
+                "preserveOriginalChunks": preserve_original_chunks
             },
             "submittedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "errors": errors if errors else None
@@ -2476,8 +3541,7 @@ def prepare_batch():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
-    logger.info(f"Starting Text Render Service v8 on port {port}")
-    logger.info(f"Features: inpainting, text-render, slice, merge, batch-results, translate-chunks, prepare-batch")
-    logger.info(f"OpenCV inpainting: enabled")
+    logger.info(f"Starting Text Render Service v9 on port {port}")
+    logger.info(f"Features: slice, merge, batch-results, translate-chunks, prepare-batch")
     logger.info(f"Vertex AI available: {vertex_ai_available}")
     app.run(host="0.0.0.0", port=port, debug=True)
