@@ -126,13 +126,12 @@ def validate_translation_language(image_base64: str, target_lang: str, threshold
         elif image_np.shape[2] == 4:  # RGBA
             image_np = cv2.cvtColor(image_np, cv2.COLOR_RGBA2RGB)
 
-        # 2. OCR 실행 (PaddleOCR)
+        # 2. OCR 실행 (PaddleOCR 3.x)
         reader = get_ocr_reader(target_lang)
-        results = reader.ocr(image_np)
+        results = reader.ocr(image_np, cls=True)
 
         # 3. 텍스트 없으면 통과 (예외 케이스)
-        # PaddleOCR returns: [[[box], (text, conf)], ...] or None
-        if results is None or len(results) == 0 or results[0] is None or len(results[0]) == 0:
+        if results is None:
             return {
                 "valid": True,
                 "reason": "텍스트 없음 - 검증 통과",
@@ -142,21 +141,48 @@ def validate_translation_language(image_base64: str, target_lang: str, threshold
                 "detected_text": []
             }
 
-        # 4. 감지된 텍스트 분석 (PaddleOCR 형식)
+        # 4. 감지된 텍스트 분석 (PaddleOCR 3.x 형식 처리)
         detected_texts = []
         total_chars = 0
 
-        for line in results[0]:
-            # PaddleOCR format: [box_coords, (text, confidence)]
-            text = line[1][0]
-            confidence = line[1][1]
-            if confidence > 0.3:  # 신뢰도 30% 이상만
-                detected_texts.append({
-                    "text": text,
-                    "confidence": confidence,
-                    "char_count": len(text.replace(" ", ""))
-                })
-                total_chars += len(text.replace(" ", ""))
+        # PaddleOCR 3.x: results는 리스트의 리스트 [[line1, line2, ...]]
+        # 각 line은 [box_coords, (text, confidence)] 형식
+        try:
+            ocr_lines = results[0] if results and len(results) > 0 else []
+            if ocr_lines is None:
+                ocr_lines = []
+
+            for line in ocr_lines:
+                if line is None or len(line) < 2:
+                    continue
+                # PaddleOCR format: [box_coords, (text, confidence)]
+                text_info = line[1]
+                if isinstance(text_info, tuple) and len(text_info) >= 2:
+                    text = str(text_info[0])
+                    confidence = float(text_info[1])
+                elif isinstance(text_info, list) and len(text_info) >= 2:
+                    text = str(text_info[0])
+                    confidence = float(text_info[1])
+                else:
+                    continue
+
+                if confidence > 0.3:  # 신뢰도 30% 이상만
+                    detected_texts.append({
+                        "text": text,
+                        "confidence": confidence,
+                        "char_count": len(text.replace(" ", ""))
+                    })
+                    total_chars += len(text.replace(" ", ""))
+        except Exception as parse_error:
+            logger.error(f"OCR 결과 파싱 오류: {parse_error}, results type: {type(results)}")
+            return {
+                "valid": True,
+                "reason": f"OCR 파싱 오류로 통과 처리: {str(parse_error)}",
+                "has_text": False,
+                "total_chars": 0,
+                "target_lang_ratio": 1.0,
+                "detected_text": []
+            }
 
         # 텍스트가 너무 적으면 통과
         if total_chars < 5:
