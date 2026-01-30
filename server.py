@@ -77,17 +77,27 @@ def get_ocr_reader(target_lang: str):
 
     if paddle_lang not in ocr_readers:
         try:
-            # PaddleOCR 초기화 (최소 파라미터로 호환성 확보)
+            # PaddleOCR 3.x 초기화 (경량 모델 사용)
             import logging
             logging.getLogger('ppocr').setLevel(logging.WARNING)
 
-            ocr_readers[paddle_lang] = PaddleOCR(lang=paddle_lang)
+            ocr_readers[paddle_lang] = PaddleOCR(
+                lang=paddle_lang,
+                use_doc_orientation_classify=False,  # 문서 방향 분류 비활성화
+                use_doc_unwarping=False,             # 문서 왜곡 보정 비활성화
+                use_textline_orientation=False       # 텍스트라인 방향 비활성화
+            )
             logger.info(f"PaddleOCR Reader 생성: {paddle_lang}")
         except Exception as e:
             logger.error(f"PaddleOCR Reader 생성 실패: {e}")
             # 실패시 영어 기본 리더 반환
             if "en" not in ocr_readers:
-                ocr_readers["en"] = PaddleOCR(lang="en")
+                ocr_readers["en"] = PaddleOCR(
+                    lang="en",
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False
+                )
             return ocr_readers["en"]
 
     return ocr_readers[paddle_lang]
