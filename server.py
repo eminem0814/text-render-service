@@ -136,9 +136,9 @@ def validate_translation_language(image_base64: str, target_lang: str, threshold
         elif image_np.shape[2] == 4:  # RGBA
             image_np = cv2.cvtColor(image_np, cv2.COLOR_RGBA2RGB)
 
-        # 2. OCR 실행 (PaddleOCR 3.x)
+        # 2. OCR 실행 (PaddleOCR 3.x - predict 메서드 사용)
         reader = get_ocr_reader(target_lang)
-        results = reader.ocr(image_np)
+        results = reader.predict(image_np)
 
         # 3. 텍스트 없으면 통과 (예외 케이스)
         if results is None:
@@ -151,38 +151,27 @@ def validate_translation_language(image_base64: str, target_lang: str, threshold
                 "detected_text": []
             }
 
-        # 4. 감지된 텍스트 분석 (PaddleOCR 3.x 형식 처리)
+        # 4. 감지된 텍스트 분석 (PaddleOCR 3.x 형식)
         detected_texts = []
         total_chars = 0
 
-        # PaddleOCR 3.x: results는 리스트의 리스트 [[line1, line2, ...]]
-        # 각 line은 [box_coords, (text, confidence)] 형식
+        # PaddleOCR 3.x: results는 이터레이터, 각 res는 json 속성 보유
+        # res.json['rec_texts'], res.json['rec_scores']
         try:
-            ocr_lines = results[0] if results and len(results) > 0 else []
-            if ocr_lines is None:
-                ocr_lines = []
+            for res in results:
+                rec_texts = res.json.get('rec_texts', [])
+                rec_scores = res.json.get('rec_scores', [])
 
-            for line in ocr_lines:
-                if line is None or len(line) < 2:
-                    continue
-                # PaddleOCR format: [box_coords, (text, confidence)]
-                text_info = line[1]
-                if isinstance(text_info, tuple) and len(text_info) >= 2:
-                    text = str(text_info[0])
-                    confidence = float(text_info[1])
-                elif isinstance(text_info, list) and len(text_info) >= 2:
-                    text = str(text_info[0])
-                    confidence = float(text_info[1])
-                else:
-                    continue
-
-                if confidence > 0.3:  # 신뢰도 30% 이상만
+                for text, confidence in zip(rec_texts, rec_scores):
+                    if confidence is None or confidence <= 0.3:
+                        continue
+                    # 신뢰도 30% 이상만
                     detected_texts.append({
-                        "text": text,
-                        "confidence": confidence,
-                        "char_count": len(text.replace(" ", ""))
+                        "text": str(text),
+                        "confidence": float(confidence),
+                        "char_count": len(str(text).replace(" ", ""))
                     })
-                    total_chars += len(text.replace(" ", ""))
+                    total_chars += len(str(text).replace(" ", ""))
         except Exception as parse_error:
             logger.error(f"OCR 결과 파싱 오류: {parse_error}, results type: {type(results)}")
             return {
