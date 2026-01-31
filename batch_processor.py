@@ -199,7 +199,7 @@ def get_invalid_chunks_for_retry(
     supabase_url: str,
     supabase_key: str
 ) -> Tuple[bool, List]:
-    """재처리 대상 청크 조회 (invalid 상태, retry_count < 3)"""
+    """재처리 대상 청크 조회 (invalid 또는 pending 상태, retry_count < 3)"""
     # 먼저 해당 배치의 이미지 ID 목록 조회
     success, images = get_image_processing_by_batch(batch_job_id, supabase_url, supabase_key)
     if not success or not images:
@@ -207,8 +207,9 @@ def get_invalid_chunks_for_retry(
 
     image_ids = [img["id"] for img in images]
 
-    # 해당 이미지들의 invalid 청크 조회
-    endpoint = f"chunk_processing?image_processing_id=in.({','.join(map(str, image_ids))})&status=eq.invalid&retry_count=lt.{MAX_RETRY_COUNT}&select=*,image_processing(product_id,image_index,batch_job_id)"
+    # 해당 이미지들의 invalid 또는 pending 청크 조회
+    # pending: Gemini에서 응답 없음, invalid: OCR 검증 실패
+    endpoint = f"chunk_processing?image_processing_id=in.({','.join(map(str, image_ids))})&status=in.(invalid,pending)&retry_count=lt.{MAX_RETRY_COUNT}&select=*,image_processing(product_id,image_index,batch_job_id)"
     return supabase_request("GET", endpoint, supabase_url, supabase_key)
 
 
@@ -543,7 +544,8 @@ def process_batch_results_v2(
                 continue
 
             valid_chunks = [c for c in chunks if c.get("status") == "valid"]
-            invalid_chunks = [c for c in chunks if c.get("status") == "invalid"]
+            # invalid 또는 pending 상태 모두 재처리 대상
+            invalid_chunks = [c for c in chunks if c.get("status") in ("invalid", "pending")]
 
             valid_count = len(valid_chunks)
             invalid_count = len(invalid_chunks)
