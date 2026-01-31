@@ -21,7 +21,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt gunicorn
 
 # 애플리케이션 코드 복사
-COPY server.py .
+COPY server.py batch_processor.py ./
 
 # 환경 변수
 ENV PORT=5001
