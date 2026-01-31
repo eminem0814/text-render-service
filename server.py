@@ -87,15 +87,11 @@ def get_ocr_reader(target_lang: str):
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
                 use_textline_orientation=False,
-                # 모바일 모델 사용 - 서버 모델 대비 9배 빠름
-                # 참고: https://www.paddleocr.ai/latest/en/version3.x/pipeline_usage/OCR.html
-                text_detection_model_name="PP-OCRv4_mobile_det",
-                text_recognition_model_name="PP-OCRv4_mobile_rec",
                 # CPU 최적화
                 cpu_threads=8,
                 enable_mkldnn=True,
-                # 대형 이미지 처리 - 내부적으로 최대 960px로 리사이즈
-                text_det_limit_side_len=960,
+                # 대형 이미지 처리 - 내부적으로 최대 736px로 리사이즈 (속도 향상)
+                text_det_limit_side_len=736,
                 text_det_limit_type='max',
                 # 텍스트 감지 민감도 조정
                 text_det_box_thresh=0.5,
@@ -113,11 +109,9 @@ def get_ocr_reader(target_lang: str):
                     use_doc_orientation_classify=False,
                     use_doc_unwarping=False,
                     use_textline_orientation=False,
-                    text_detection_model_name="PP-OCRv4_mobile_det",
-                    text_recognition_model_name="PP-OCRv4_mobile_rec",
                     cpu_threads=8,
                     enable_mkldnn=True,
-                    text_det_limit_side_len=960,
+                    text_det_limit_side_len=736,
                     text_det_limit_type='max',
                     text_det_box_thresh=0.5,
                     text_det_thresh=0.3,
