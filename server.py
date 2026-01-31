@@ -157,18 +157,22 @@ def validate_translation_language(image_base64: str, target_lang: str, threshold
 
         # PaddleOCR 3.x: results는 이터레이터, 각 res는 json 속성 보유
         # res.json['rec_texts'], res.json['rec_scores']
+        debug_info = {"result_type": str(type(results)), "items": []}
         try:
             for res in results:
-                # 디버깅: 결과 구조 로깅
-                logger.info(f"OCR result type: {type(res)}")
+                # 디버깅: 결과 구조 수집
+                item_debug = {"res_type": str(type(res))}
                 if hasattr(res, 'json'):
-                    logger.info(f"OCR res.json keys: {res.json.keys() if hasattr(res.json, 'keys') else type(res.json)}")
-                    logger.info(f"OCR res.json: {str(res.json)[:500]}")
+                    item_debug["json_type"] = str(type(res.json))
+                    item_debug["json_keys"] = list(res.json.keys()) if hasattr(res.json, 'keys') else None
+                    item_debug["json_sample"] = str(res.json)[:300]
+                debug_info["items"].append(item_debug)
 
                 rec_texts = res.json.get('rec_texts', []) if hasattr(res.json, 'get') else []
                 rec_scores = res.json.get('rec_scores', []) if hasattr(res.json, 'get') else []
 
-                logger.info(f"rec_texts count: {len(rec_texts)}, rec_scores count: {len(rec_scores)}")
+                item_debug["rec_texts_count"] = len(rec_texts)
+                item_debug["rec_scores_count"] = len(rec_scores)
 
                 for text, confidence in zip(rec_texts, rec_scores):
                     if confidence is None or confidence <= 0.3:
@@ -199,7 +203,8 @@ def validate_translation_language(image_base64: str, target_lang: str, threshold
                 "has_text": True,
                 "total_chars": total_chars,
                 "target_lang_ratio": 1.0,
-                "detected_text": detected_texts
+                "detected_text": detected_texts,
+                "debug_info": debug_info
             }
 
         # 5. 언어 판별 (간단한 휴리스틱)
@@ -1432,7 +1437,8 @@ def ocr_detect_endpoint():
             "has_text": result.get("has_text", False),
             "total_chars": result.get("total_chars", 0),
             "target_lang_ratio": result.get("target_lang_ratio", 1.0),
-            "detected_texts": result.get("detected_text", [])
+            "detected_texts": result.get("detected_text", []),
+            "debug": result.get("debug_info")  # 디버깅용
         })
 
     except Exception as e:
