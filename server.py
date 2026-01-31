@@ -86,8 +86,8 @@ def get_ocr_reader(target_lang: str):
             ocr_readers[paddle_lang] = PaddleOCR(
                 lang=paddle_lang,
                 # 균형 최적 모델: Detection Mobile (4.7MB) + Recognition Server (81MB)
-                text_det_model_name="PP-OCRv5_mobile_det",
-                text_rec_model_name="PP-OCRv5_server_rec",
+                text_detection_model_name="PP-OCRv5_mobile_det",
+                text_recognition_model_name="PP-OCRv5_server_rec",
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
                 use_textline_orientation=False,
@@ -107,8 +107,8 @@ def get_ocr_reader(target_lang: str):
             if "en" not in ocr_readers:
                 ocr_readers["en"] = PaddleOCR(
                     lang="en",
-                    text_det_model_name="PP-OCRv5_mobile_det",
-                    text_rec_model_name="PP-OCRv5_server_rec",
+                    text_detection_model_name="PP-OCRv5_mobile_det",
+                    text_recognition_model_name="PP-OCRv5_server_rec",
                     use_doc_orientation_classify=False,
                     use_doc_unwarping=False,
                     use_textline_orientation=False,
