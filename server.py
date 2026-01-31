@@ -87,14 +87,21 @@ def get_ocr_reader(target_lang: str):
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
                 use_textline_orientation=False,
-                # 대형 이미지 처리 최적화 - 내부적으로 최대 960px로 리사이즈
-                text_det_limit_side_len=960,   # 최대 변 길이 제한
-                text_det_limit_type='max',     # 최대 변 기준으로 리사이즈
+                # 모바일 모델 사용 - 서버 모델 대비 9배 빠름
+                # 참고: https://www.paddleocr.ai/latest/en/version3.x/pipeline_usage/OCR.html
+                text_detection_model_name="PP-OCRv4_mobile_det",
+                text_recognition_model_name="PP-OCRv4_mobile_rec",
+                # CPU 최적화
+                cpu_threads=8,
+                enable_mkldnn=True,
+                # 대형 이미지 처리 - 내부적으로 최대 960px로 리사이즈
+                text_det_limit_side_len=960,
+                text_det_limit_type='max',
                 # 텍스트 감지 민감도 조정
-                text_det_box_thresh=0.5,       # 박스 임계값 (기본 0.6)
-                text_det_thresh=0.3,           # 픽셀 임계값
-                text_det_unclip_ratio=1.6,     # 확장 비율
-                text_rec_score_thresh=0.3,     # 인식 점수 임계값 (기본 0.5)
+                text_det_box_thresh=0.5,
+                text_det_thresh=0.3,
+                text_det_unclip_ratio=1.6,
+                text_rec_score_thresh=0.3,
             )
             logger.info(f"PaddleOCR Reader 생성: {paddle_lang}")
         except Exception as e:
@@ -106,6 +113,10 @@ def get_ocr_reader(target_lang: str):
                     use_doc_orientation_classify=False,
                     use_doc_unwarping=False,
                     use_textline_orientation=False,
+                    text_detection_model_name="PP-OCRv4_mobile_det",
+                    text_recognition_model_name="PP-OCRv4_mobile_rec",
+                    cpu_threads=8,
+                    enable_mkldnn=True,
                     text_det_limit_side_len=960,
                     text_det_limit_type='max',
                     text_det_box_thresh=0.5,
