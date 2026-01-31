@@ -2664,158 +2664,29 @@ def process_batch_results():
                 logger.warning(f"Line {line_num}: No image data for {custom_id}")
                 continue
 
-            # ===== 청크 검증 (크기 + OCR 번역 언어) 및 자동 재시도 =====
+            # ===== 청크 크기 검증만 수행 (OCR은 병합 후 수행) =====
             expected_width = meta.get("chunkWidth")
             expected_height = meta.get("chunkHeight")
 
-            # config에서 대상 언어 가져오기
-            target_lang = config.get("targetLangCode", "en")
-
-            # OCR 검증 활성화 여부 (기본: 활성화)
-            enable_ocr_validation = config.get("enableOcrValidation", True)
-
-            # 통합 검증 (크기 + 번역 언어)
-            validation = validate_translated_chunk(
-                chunk_base64=translated_base64,
-                target_lang=target_lang,
+            # 크기 검증만 수행 (빠름)
+            size_validation = validate_chunk(
+                translated_base64,
                 expected_width=expected_width,
                 expected_height=expected_height,
-                size_tolerance=0.3,  # 크기 30% 오차 허용
-                lang_threshold=0.2,  # 비타겟 언어 20% 이상이면 불량
-                skip_ocr=not enable_ocr_validation
+                tolerance=0.3  # 30% 오차 허용
             )
 
-            if not validation["valid"]:
-                defect_type = validation.get("defect_type", "unknown")
-                logger.warning(f"[검증 실패] {custom_id}: {validation['reason']} (유형: {defect_type})")
-
-                # 불량 유형별 통계 업데이트
-                if defect_type == "size":
-                    validation_stats["size_defects"] = validation_stats.get("size_defects", 0) + 1
-                elif defect_type == "translation":
-                    validation_stats["translation_defects"] = validation_stats.get("translation_defects", 0) + 1
-
-                # 재처리 가능한 경우에만 재시도
-                if validation.get("can_retry", True):
-                    prompt = config.get("prompt", "Translate the text in this image to English.")
-                    gemini_model = config.get("geminiModel", "gemini-3-pro-image-preview")
-
-                    # 원본 청크 가져오기 시도
-                    original_chunk_base64 = None
-                    batch_id = meta.get("batchId")
-                    original_chunk_path = meta.get("originalChunkPath")
-
-                    if batch_id and original_chunk_path:
-                        logger.info(f"[원본 청크 조회] {custom_id}: batch_id={batch_id}")
-                        original_result = get_original_chunk(
-                            chunk_key=custom_id,
-                            batch_id=batch_id,
-                            supabase_url=config.get("supabaseUrl") or SUPABASE_URL,
-                            supabase_key=config.get("supabaseKey") or SUPABASE_SERVICE_KEY
-                        )
-                        if original_result["success"]:
-                            original_chunk_base64 = original_result["base64"]
-                            logger.info(f"[원본 청크 조회 성공] {custom_id}")
-                        else:
-                            logger.warning(f"[원본 청크 조회 실패] {custom_id}: {original_result['error']}")
-
-                    # 원본 청크가 있으면 원본으로, 없으면 번역 실패본으로 재시도
-                    retry_chunk = original_chunk_base64 if original_chunk_base64 else translated_base64
-                    retry_source = "원본" if original_chunk_base64 else "번역본"
-
-                    if original_chunk_base64:
-                        validation_stats["original_chunk_used"] = validation_stats.get("original_chunk_used", 0) + 1
-
-                    retry_result = retry_chunk_realtime(
-                        chunk_base64=retry_chunk,
-                        gemini_api_key=gemini_api_key,
-                        prompt=prompt,
-                        gemini_model=gemini_model,
-                        max_retries=2
-                    )
-
-                    if retry_result["success"]:
-                        # 재시도 결과 검증 (OCR 포함)
-                        retry_validation = validate_translated_chunk(
-                            chunk_base64=retry_result["base64"],
-                            target_lang=target_lang,
-                            expected_width=expected_width,
-                            expected_height=expected_height,
-                            size_tolerance=0.3,
-                            lang_threshold=0.2,
-                            skip_ocr=not enable_ocr_validation
-                        )
-
-                        if retry_validation["valid"]:
-                            translated_base64 = retry_result["base64"]
-                            logger.info(f"[재시도 성공] {custom_id}: {retry_source}으로 검증 통과")
-                            validation_stats["retry_success"] = validation_stats.get("retry_success", 0) + 1
-                        else:
-                            logger.warning(f"[재시도 실패] {custom_id}: {retry_source}으로 재시도 후에도 검증 실패 - {retry_validation['reason']}")
-                            validation_stats["retry_failed"] = validation_stats.get("retry_failed", 0) + 1
-
-                            # 재처리 대기열에 추가
-                            chunk_info = {
-                                "batch_id": meta.get("batchId"),
-                                "chunk_key": custom_id,
-                                "product_id": meta.get("productId"),
-                                "product_code": meta.get("productCode"),
-                                "image_index": meta.get("imageIndex"),
-                                "chunk_index": meta.get("chunkIndex"),
-                                "total_chunks": meta.get("totalChunks"),
-                                "chunk_width": expected_width,
-                                "chunk_height": expected_height,
-                                "original_chunk_path": meta.get("originalChunkPath")
-                            }
-                            queue_result = enqueue_failed_chunk(
-                                chunk_info=chunk_info,
-                                config=config,
-                                error_reason=retry_validation['reason'],
-                                supabase_url=config.get("supabaseUrl"),
-                                supabase_key=config.get("supabaseKey")
-                            )
-                            if queue_result["success"]:
-                                validation_stats["queued_for_retry"] = validation_stats.get("queued_for_retry", 0) + 1
-                                logger.info(f"[대기열 추가] {custom_id}: queue_id={queue_result['queue_id']}")
-                    else:
-                        logger.warning(f"[재시도 실패] {custom_id}: {retry_result['error']}")
-                        validation_stats["retry_failed"] = validation_stats.get("retry_failed", 0) + 1
-
-                        # 재처리 대기열에 추가
-                        chunk_info = {
-                            "batch_id": meta.get("batchId"),
-                            "chunk_key": custom_id,
-                            "product_id": meta.get("productId"),
-                            "product_code": meta.get("productCode"),
-                            "image_index": meta.get("imageIndex"),
-                            "chunk_index": meta.get("chunkIndex"),
-                            "total_chunks": meta.get("totalChunks"),
-                            "chunk_width": expected_width,
-                            "chunk_height": expected_height,
-                            "original_chunk_path": meta.get("originalChunkPath")
-                        }
-                        queue_result = enqueue_failed_chunk(
-                            chunk_info=chunk_info,
-                            config=config,
-                            error_reason=retry_result.get('error', 'Unknown error'),
-                            supabase_url=config.get("supabaseUrl"),
-                            supabase_key=config.get("supabaseKey")
-                        )
-                        if queue_result["success"]:
-                            validation_stats["queued_for_retry"] = validation_stats.get("queued_for_retry", 0) + 1
-                            logger.info(f"[대기열 추가] {custom_id}: queue_id={queue_result['queue_id']}")
-                else:
-                    logger.error(f"[재처리 불가] {custom_id}: 데이터 손상으로 재처리 불가")
-                    validation_stats["unretryable"] = validation_stats.get("unretryable", 0) + 1
-
+            if not size_validation["valid"]:
+                logger.warning(f"[크기 검증 실패] {custom_id}: {size_validation['reason']}")
+                validation_stats["size_defects"] = validation_stats.get("size_defects", 0) + 1
                 validation_stats["validation_failed"] = validation_stats.get("validation_failed", 0) + 1
+                # 크기가 너무 작으면 스킵 (데이터 손상)
+                if size_validation.get("actual_width", 0) < 50 or size_validation.get("actual_height", 0) < 50:
+                    logger.error(f"[스킵] {custom_id}: 이미지 크기가 너무 작음")
+                    continue
             else:
                 validation_stats["validation_passed"] = validation_stats.get("validation_passed", 0) + 1
-                # 번역 검증 결과 로깅 (디버깅용)
-                trans_val = validation.get("translation_validation")
-                if trans_val and trans_val.get("has_text"):
-                    logger.debug(f"[검증 통과] {custom_id}: 타겟 언어 비율 {trans_val.get('target_lang_ratio', 0):.1%}")
-            # ===== 검증 끝 =====
+            # ===== 크기 검증 끝 =====
 
             image_key = f"{meta['productId']}_{meta['imageIndex']}"
 
@@ -2898,6 +2769,28 @@ def process_batch_results():
                     merged_image = merge_images(sorted_chunks, overlap=0, blend_height=50, target_width=original_width)
                     merged_base64, _ = image_to_base64(merged_image, format=pil_format, quality=output_quality)
 
+                # ===== 병합된 이미지 OCR 검증 (이미지 단위로 수행) =====
+                enable_ocr_validation = config.get("enableOcrValidation", True)
+                ocr_validation_result = None
+
+                if enable_ocr_validation:
+                    try:
+                        ocr_validation_result = validate_translation_language(
+                            merged_base64,
+                            target_lang_code,
+                            threshold=0.2  # 비타겟 언어 20% 이상이면 불량
+                        )
+
+                        if ocr_validation_result["valid"]:
+                            logger.info(f"[OCR 검증 통과] {image_key}: 타겟 언어 비율 {ocr_validation_result.get('target_lang_ratio', 0):.1%}")
+                        else:
+                            logger.warning(f"[OCR 검증 실패] {image_key}: {ocr_validation_result['reason']}")
+                            validation_stats["translation_defects"] = validation_stats.get("translation_defects", 0) + 1
+                    except Exception as ocr_err:
+                        logger.warning(f"[OCR 검증 오류] {image_key}: {ocr_err} - 검증 스킵")
+                        ocr_validation_result = {"valid": True, "reason": f"검증 오류로 통과 처리: {str(ocr_err)}"}
+                # ===== OCR 검증 끝 =====
+
                 # Supabase Storage 업로드
                 if supabase_url and supabase_key:
                     image_num = str(image_data["imageIndex"] + 1).zfill(2)
@@ -2936,7 +2829,12 @@ def process_batch_results():
                     "totalChunks": image_data["totalChunks"],
                     "uploadedUrl": public_url,
                     "success": public_url is not None,
-                    "uploadError": upload_error
+                    "uploadError": upload_error,
+                    "ocrValidation": {
+                        "valid": ocr_validation_result.get("valid", True) if ocr_validation_result else None,
+                        "reason": ocr_validation_result.get("reason") if ocr_validation_result else "검증 스킵",
+                        "targetLangRatio": ocr_validation_result.get("target_lang_ratio") if ocr_validation_result else None
+                    } if enable_ocr_validation else None
                 })
 
             except Exception as img_err:
