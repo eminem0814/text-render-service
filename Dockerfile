@@ -38,5 +38,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
 
 EXPOSE ${PORT}
 
-# Gunicorn으로 프로덕션 실행
-CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT} --workers ${WORKERS} --timeout 300 --keep-alive 5 server:app"]
+# Gunicorn으로 프로덕션 실행 (타임아웃 10분)
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT} --workers ${WORKERS} --timeout 600 --graceful-timeout 600 --keep-alive 5 server:app"]
