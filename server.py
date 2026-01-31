@@ -77,15 +77,21 @@ def get_ocr_reader(target_lang: str):
 
     if paddle_lang not in ocr_readers:
         try:
-            # PaddleOCR 3.x 초기화 (경량 모델 사용)
+            # PaddleOCR 3.x 초기화
+            # 참고: https://www.paddleocr.ai/latest/en/version3.x/pipeline_usage/OCR.html
             import logging
             logging.getLogger('ppocr').setLevel(logging.WARNING)
 
             ocr_readers[paddle_lang] = PaddleOCR(
                 lang=paddle_lang,
-                use_doc_orientation_classify=False,  # 문서 방향 분류 비활성화
-                use_doc_unwarping=False,             # 문서 왜곡 보정 비활성화
-                use_textline_orientation=False       # 텍스트라인 방향 비활성화
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+                # 텍스트 감지 민감도 조정
+                text_det_box_thresh=0.5,       # 박스 임계값 (기본 0.6)
+                text_det_thresh=0.3,           # 픽셀 임계값
+                text_det_unclip_ratio=1.6,     # 확장 비율
+                text_rec_score_thresh=0.3,     # 인식 점수 임계값 (기본 0.5)
             )
             logger.info(f"PaddleOCR Reader 생성: {paddle_lang}")
         except Exception as e:
@@ -96,7 +102,11 @@ def get_ocr_reader(target_lang: str):
                     lang="en",
                     use_doc_orientation_classify=False,
                     use_doc_unwarping=False,
-                    use_textline_orientation=False
+                    use_textline_orientation=False,
+                    text_det_box_thresh=0.5,
+                    text_det_thresh=0.3,
+                    text_det_unclip_ratio=1.6,
+                    text_rec_score_thresh=0.3,
                 )
             return ocr_readers["en"]
 
@@ -168,9 +178,12 @@ def validate_translation_language(image_base64: str, target_lang: str, threshold
                     item_debug["json_sample"] = str(res.json)[:300]
                 debug_info["items"].append(item_debug)
 
-                rec_texts = res.json.get('rec_texts', []) if hasattr(res.json, 'get') else []
-                rec_scores = res.json.get('rec_scores', []) if hasattr(res.json, 'get') else []
+                # PaddleOCR 3.x: res.json['res'] 안에 실제 결과가 있음
+                inner_res = res.json.get('res', {}) if hasattr(res.json, 'get') else {}
+                rec_texts = inner_res.get('rec_texts', []) if hasattr(inner_res, 'get') else []
+                rec_scores = inner_res.get('rec_scores', []) if hasattr(inner_res, 'get') else []
 
+                item_debug["inner_res_keys"] = list(inner_res.keys()) if hasattr(inner_res, 'keys') else None
                 item_debug["rec_texts_count"] = len(rec_texts)
                 item_debug["rec_scores_count"] = len(rec_scores)
 
