@@ -87,9 +87,6 @@ def get_ocr_reader(target_lang: str):
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
                 use_textline_orientation=False,
-                # CPU 최적화
-                cpu_threads=8,
-                enable_mkldnn=True,
                 # 대형 이미지 처리 - 내부적으로 최대 736px로 리사이즈 (속도 향상)
                 text_det_limit_side_len=736,
                 text_det_limit_type='max',
@@ -109,8 +106,6 @@ def get_ocr_reader(target_lang: str):
                     use_doc_orientation_classify=False,
                     use_doc_unwarping=False,
                     use_textline_orientation=False,
-                    cpu_threads=8,
-                    enable_mkldnn=True,
                     text_det_limit_side_len=736,
                     text_det_limit_type='max',
                     text_det_box_thresh=0.5,
