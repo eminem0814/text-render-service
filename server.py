@@ -124,6 +124,60 @@ def get_ocr_reader(target_lang: str):
     return ocr_readers[paddle_lang]
 
 
+def has_text_in_image(image_base64: str, min_chars: int = 5) -> bool:
+    """
+    이미지에 텍스트가 있는지 빠르게 확인 (경량 OCR)
+
+    Args:
+        image_base64: 검사할 이미지의 base64 문자열
+        min_chars: 최소 문자 수 (기본 5자 이상이면 텍스트 있음으로 판단)
+
+    Returns:
+        bool: 텍스트 존재 여부
+    """
+    try:
+        # 이미지 디코딩
+        image_bytes = base64.b64decode(image_base64)
+        image = Image.open(BytesIO(image_bytes))
+        image_np = np.array(image)
+
+        # RGB 변환
+        if len(image_np.shape) == 2:
+            pass
+        elif image_np.shape[2] == 4:
+            image_np = cv2.cvtColor(image_np, cv2.COLOR_RGBA2RGB)
+
+        # OCR 실행 (영어 리더 사용 - 가장 범용적)
+        reader = get_ocr_reader("en")
+        results = reader.predict(image_np)
+
+        if results is None:
+            return False
+
+        # 텍스트 카운트
+        total_chars = 0
+        try:
+            for res in results:
+                inner_res = res.json.get('res', {}) if hasattr(res.json, 'get') else {}
+                rec_texts = inner_res.get('rec_texts', []) if hasattr(inner_res, 'get') else []
+                rec_scores = inner_res.get('rec_scores', []) if hasattr(inner_res, 'get') else []
+
+                for text, confidence in zip(rec_texts, rec_scores):
+                    if confidence is None or confidence <= 0.3:
+                        continue
+                    total_chars += len(str(text).replace(" ", ""))
+                    if total_chars >= min_chars:
+                        return True  # 조기 종료 - 텍스트 발견
+        except Exception:
+            return False
+
+        return total_chars >= min_chars
+
+    except Exception as e:
+        logger.warning(f"텍스트 감지 오류: {e}")
+        return True  # 오류 시 텍스트 있다고 가정 (안전하게)
+
+
 def validate_translation_language(image_base64: str, target_lang: str, threshold: float = 0.2) -> dict:
     """
     OCR을 사용하여 번역된 이미지가 올바른 언어인지 검증
@@ -3266,6 +3320,8 @@ def prepare_batch():
         temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False)
         chunk_metadata = []
         total_chunks = 0
+        gemini_chunks = 0  # Gemini에 보낼 청크 수
+        skipped_no_text = 0  # 텍스트 없어서 스킵한 청크 수
         errors = []
         processed_images = 0
         saved_original_chunks = 0
@@ -3293,25 +3349,34 @@ def prepare_batch():
                 for chunk_idx, chunk in enumerate(chunks):
                     request_key = f"p{img_req['productId']}_i{img_req['imageIndex']}_c{chunk_idx}"
 
-                    batch_request = {
-                        "key": request_key,
-                        "request": {
-                            "contents": [{
-                                "parts": [
-                                    {"text": prompt},
-                                    {"inline_data": {"mime_type": "image/jpeg", "data": chunk["base64"]}}
-                                ]
-                            }],
-                            "generation_config": {
-                                "response_modalities": ["TEXT", "IMAGE"]
+                    # 텍스트 유무 확인 (텍스트 없으면 Gemini 호출 불필요)
+                    chunk_has_text = has_text_in_image(chunk["base64"], min_chars=5)
+
+                    if chunk_has_text:
+                        # 텍스트 있음 → Gemini 배치 요청 생성
+                        batch_request = {
+                            "key": request_key,
+                            "request": {
+                                "contents": [{
+                                    "parts": [
+                                        {"text": prompt},
+                                        {"inline_data": {"mime_type": "image/jpeg", "data": chunk["base64"]}}
+                                    ]
+                                }],
+                                "generation_config": {
+                                    "response_modalities": ["TEXT", "IMAGE"]
+                                }
                             }
                         }
-                    }
 
-                    # 파일에 직접 쓰기 (메모리 절약)
-                    temp_file.write(json.dumps(batch_request) + '\n')
+                        # 파일에 직접 쓰기 (메모리 절약)
+                        temp_file.write(json.dumps(batch_request) + '\n')
+                        gemini_chunks += 1
+                    else:
+                        skipped_no_text += 1
+                        logger.info(f"[prepare-batch] 텍스트 없음 - Gemini 스킵: {request_key}")
 
-                    # 원본 청크 저장 (재처리용)
+                    # 원본 청크 저장 (재처리용 - 텍스트 유무와 관계없이)
                     original_chunk_path = ""
                     if preserve_original_chunks:
                         save_result = save_original_chunk(
@@ -3339,7 +3404,8 @@ def prepare_batch():
                         "yStart": chunk["y_start"],
                         "yEnd": chunk["y_end"],
                         "originalChunkPath": original_chunk_path,  # 원본 청크 경로
-                        "batchId": batch_id  # 배치 ID
+                        "batchId": batch_id,  # 배치 ID
+                        "hasText": chunk_has_text  # 텍스트 유무 플래그
                     })
 
                     total_chunks += 1
@@ -3367,7 +3433,9 @@ def prepare_batch():
         logger.info("=" * 60)
         logger.info(f"[prepare-batch] 청크 생성 완료")
         logger.info(f"  - 처리된 이미지: {processed_images}")
-        logger.info(f"  - 생성된 청크: {total_chunks}")
+        logger.info(f"  - 총 청크: {total_chunks}")
+        logger.info(f"  - Gemini 전송: {gemini_chunks} (번역 필요)")
+        logger.info(f"  - 텍스트 없음: {skipped_no_text} (원본 사용)")
         logger.info(f"  - 저장된 원본 청크: {saved_original_chunks}")
         logger.info(f"  - 에러: {len(errors)}")
 
@@ -3479,6 +3547,8 @@ def prepare_batch():
             "totalProducts": len(product_map),
             "totalImages": len(image_requests),
             "totalChunks": total_chunks,
+            "geminiChunks": gemini_chunks,  # Gemini에 전송한 청크 수
+            "skippedNoText": skipped_no_text,  # 텍스트 없어서 스킵한 청크 수
             "savedOriginalChunks": saved_original_chunks,  # 저장된 원본 청크 수
             "chunkMetadata": chunk_metadata,
             "productMap": product_map,

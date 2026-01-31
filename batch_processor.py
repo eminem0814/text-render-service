@@ -20,6 +20,37 @@ logger = logging.getLogger(__name__)
 # ===== 상수 =====
 MAX_RETRY_COUNT = 3  # 최대 재처리 횟수
 OCR_THRESHOLD = 0.2  # 비타겟 언어 20% 이상이면 불량
+ORIGINAL_CHUNKS_BUCKET = "original-chunks"  # 원본 청크 저장 버킷
+
+
+def fetch_original_chunk_from_storage(
+    chunk_key: str,
+    batch_id: str,
+    supabase_url: str,
+    supabase_key: str
+) -> str:
+    """Supabase Storage에서 원본 청크 base64 조회"""
+    try:
+        storage_path = f"{batch_id}/{chunk_key}.jpg"
+        download_url = f"{supabase_url}/storage/v1/object/{ORIGINAL_CHUNKS_BUCKET}/{storage_path}"
+
+        response = requests.get(
+            download_url,
+            headers={
+                "apikey": supabase_key,
+                "Authorization": f"Bearer {supabase_key}"
+            },
+            timeout=30
+        )
+
+        if response.status_code == 200:
+            return base64.b64encode(response.content).decode('utf-8')
+        else:
+            logger.warning(f"Failed to fetch original chunk {chunk_key}: {response.status_code}")
+            return ""
+    except Exception as e:
+        logger.error(f"Error fetching original chunk {chunk_key}: {e}")
+        return ""
 
 
 # ===== DB 헬퍼 함수 =====
@@ -319,6 +350,121 @@ def process_batch_results_v2(
 
     # 이미지별 메타정보만 저장 (base64 제외)
     image_meta = {}  # {image_key: {productId, imageIndex, totalChunks, originalWidth, chunks_processed: set}}
+
+    # ===== Phase 0: 텍스트 없는 청크 먼저 처리 =====
+    no_text_chunks = [m for m in chunk_metadata if not m.get("hasText", True)]
+    no_text_count = 0
+
+    if no_text_chunks:
+        logger.info(f"[BatchV3] Processing {len(no_text_chunks)} chunks without text (using original)")
+
+        for meta in no_text_chunks:
+            product_id = meta["productId"]
+            image_index = meta["imageIndex"]
+            chunk_index = meta["chunkIndex"]
+            total_chunks = meta.get("totalChunks", 1)
+            image_key = f"{product_id}_{image_index}"
+
+            # 이미지 메타정보 초기화
+            if image_key not in image_meta:
+                image_meta[image_key] = {
+                    "productId": product_id,
+                    "imageIndex": image_index,
+                    "totalChunks": total_chunks,
+                    "originalWidth": meta.get("chunkWidth"),
+                    "originalUrl": meta.get("originalUrl", ""),
+                    "chunks_processed": set(),
+                    "image_processing_id": None
+                }
+
+            # 이미지 처리 레코드 생성/조회
+            if image_meta[image_key]["image_processing_id"] is None:
+                success, existing = supabase_request(
+                    "GET",
+                    f"image_processing?batch_job_id=eq.{job_id}&product_id=eq.{product_id}&image_index=eq.{image_index}",
+                    supabase_url, supabase_key
+                )
+
+                if success and existing:
+                    image_meta[image_key]["image_processing_id"] = existing[0]["id"]
+                else:
+                    success, result = create_image_processing_record(
+                        job_id, product_id, image_index,
+                        meta.get("originalUrl", ""),
+                        total_chunks,
+                        supabase_url, supabase_key
+                    )
+                    if success:
+                        image_meta[image_key]["image_processing_id"] = result[0]["id"]
+                    else:
+                        logger.error(f"[BatchV3] Failed to create image record for no-text chunk: {result}")
+                        continue
+
+            image_processing_id = image_meta[image_key]["image_processing_id"]
+
+            # 청크 레코드 생성 (이미 존재하면 스킵)
+            success, existing_chunk = supabase_request(
+                "GET",
+                f"chunk_processing?image_processing_id=eq.{image_processing_id}&chunk_index=eq.{chunk_index}",
+                supabase_url, supabase_key
+            )
+
+            if success and existing_chunk and existing_chunk[0].get("status") == "valid":
+                image_meta[image_key]["chunks_processed"].add(chunk_index)
+                continue
+
+            # 원본 base64 가져오기 (Storage에서 또는 DB에서)
+            original_b64 = ""
+            batch_id = meta.get("batchId", "")
+            chunk_key = meta.get("key", "")
+
+            if success and existing_chunk:
+                chunk_id = existing_chunk[0]["id"]
+                # 기존 레코드에서 original_base64 가져오기
+                original_b64 = existing_chunk[0].get("original_base64", "")
+            else:
+                # Storage에서 원본 청크 가져오기
+                if batch_id and chunk_key:
+                    original_b64 = fetch_original_chunk_from_storage(
+                        chunk_key, batch_id, supabase_url, supabase_key
+                    )
+
+                success, result = create_chunk_processing_record(
+                    image_processing_id, chunk_index, original_b64,
+                    supabase_url, supabase_key
+                )
+                if not success:
+                    logger.error(f"[BatchV3] Failed to create chunk record for no-text: {result}")
+                    continue
+                chunk_id = result[0]["id"]
+
+            # 원본이 없으면 Storage에서 다시 시도
+            if not original_b64 and batch_id and chunk_key:
+                original_b64 = fetch_original_chunk_from_storage(
+                    chunk_key, batch_id, supabase_url, supabase_key
+                )
+
+            if not original_b64:
+                logger.warning(f"[BatchV3] No original base64 for no-text chunk {chunk_key}, skipping")
+                continue
+
+            # 텍스트 없음 → 원본을 번역 결과로 사용, valid 처리
+            update_chunk_status(
+                chunk_id, "valid",
+                supabase_url, supabase_key,
+                translated_base64=original_b64,  # 원본 그대로 사용
+                validation_result={
+                    "valid": True,
+                    "reason": "텍스트 없음 - 원본 이미지 사용",
+                    "has_text": False,
+                    "no_text_chunk": True
+                }
+            )
+
+            image_meta[image_key]["chunks_processed"].add(chunk_index)
+            no_text_count += 1
+
+        logger.info(f"[BatchV3] Processed {no_text_count} no-text chunks as valid")
 
     download_url = f"https://generativelanguage.googleapis.com/download/v1beta/{gemini_file_name}:download?alt=media"
 
