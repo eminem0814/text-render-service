@@ -176,26 +176,12 @@ def validate_translation_language(image_base64: str, target_lang: str, threshold
         total_chars = 0
 
         # PaddleOCR 3.x: results는 이터레이터, 각 res는 json 속성 보유
-        # res.json['rec_texts'], res.json['rec_scores']
-        debug_info = {"result_type": str(type(results)), "items": []}
         try:
             for res in results:
-                # 디버깅: 결과 구조 수집
-                item_debug = {"res_type": str(type(res))}
-                if hasattr(res, 'json'):
-                    item_debug["json_type"] = str(type(res.json))
-                    item_debug["json_keys"] = list(res.json.keys()) if hasattr(res.json, 'keys') else None
-                    item_debug["json_sample"] = str(res.json)[:300]
-                debug_info["items"].append(item_debug)
-
                 # PaddleOCR 3.x: res.json['res'] 안에 실제 결과가 있음
                 inner_res = res.json.get('res', {}) if hasattr(res.json, 'get') else {}
                 rec_texts = inner_res.get('rec_texts', []) if hasattr(inner_res, 'get') else []
                 rec_scores = inner_res.get('rec_scores', []) if hasattr(inner_res, 'get') else []
-
-                item_debug["inner_res_keys"] = list(inner_res.keys()) if hasattr(inner_res, 'keys') else None
-                item_debug["rec_texts_count"] = len(rec_texts)
-                item_debug["rec_scores_count"] = len(rec_scores)
 
                 for text, confidence in zip(rec_texts, rec_scores):
                     if confidence is None or confidence <= 0.3:
@@ -226,8 +212,7 @@ def validate_translation_language(image_base64: str, target_lang: str, threshold
                 "has_text": True,
                 "total_chars": total_chars,
                 "target_lang_ratio": 1.0,
-                "detected_text": detected_texts,
-                "debug_info": debug_info
+                "detected_text": detected_texts
             }
 
         # 5. 언어 판별 (간단한 휴리스틱)
@@ -1460,8 +1445,7 @@ def ocr_detect_endpoint():
             "has_text": result.get("has_text", False),
             "total_chars": result.get("total_chars", 0),
             "target_lang_ratio": result.get("target_lang_ratio", 1.0),
-            "detected_texts": result.get("detected_text", []),
-            "debug": result.get("debug_info")  # 디버깅용
+            "detected_texts": result.get("detected_text", [])
         })
 
     except Exception as e:
