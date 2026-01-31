@@ -1,9 +1,10 @@
 """
-텍스트 번역 및 렌더링 서비스 v9
+텍스트 번역 및 렌더링 서비스 v10
 - 긴 이미지 슬라이스/병합 지원
 - Gemini 배치 처리 결과 처리
 - 청크 번역 및 검증
 - OCR 기반 번역 언어 검증
+- v10: 이미지 단위 처리, 청크별 검증, 재처리 루프
 """
 
 from flask import Flask, request, jsonify
@@ -3508,9 +3509,671 @@ def prepare_batch():
         return jsonify({"error": str(e)}), 500
 
 
+# ===== v10: 새로운 배치 처리 시스템 =====
+from batch_processor import (
+    process_batch_results_v2,
+    get_batch_progress,
+    get_invalid_chunks_for_retry,
+    check_and_complete_images,
+    update_chunk_status,
+    update_image_status,
+    supabase_request,
+    MAX_RETRY_COUNT
+)
+
+
+@app.route("/gemini-batch-webhook", methods=["POST"])
+def gemini_batch_webhook():
+    """
+    Gemini 배치 완료 웹훅 수신
+
+    구글에서 배치 작업이 완료되면 이 엔드포인트로 알림이 옵니다.
+    웹훅을 받으면 결과 처리를 시작합니다.
+
+    Request (from Google):
+        batch_job_name: 배치 작업 이름
+        state: 상태 (BATCH_STATE_SUCCEEDED, BATCH_STATE_FAILED 등)
+
+    또는 n8n에서 직접 호출:
+        job_id: batch_jobs 테이블의 ID
+        gemini_batch_name: Gemini 배치 이름
+        config: 설정
+    """
+    try:
+        data = request.get_json() or {}
+
+        # n8n에서 직접 호출하는 경우
+        job_id = data.get("job_id")
+        gemini_batch_name = data.get("gemini_batch_name")
+        config = data.get("config", {})
+
+        if not job_id or not gemini_batch_name:
+            return jsonify({"error": "job_id and gemini_batch_name required"}), 400
+
+        supabase_url = config.get("supabaseUrl") or SUPABASE_URL
+        supabase_key = config.get("supabaseKey") or SUPABASE_SERVICE_KEY
+        gemini_api_key = config.get("geminiApiKey")
+
+        if not gemini_api_key:
+            return jsonify({"error": "geminiApiKey required in config"}), 400
+
+        logger.info(f"[Webhook] Received batch completion for job {job_id}: {gemini_batch_name}")
+
+        # Gemini 배치 상태 확인
+        status_url = f"https://generativelanguage.googleapis.com/v1beta/{gemini_batch_name}?key={gemini_api_key}"
+        status_response = requests.get(status_url, timeout=30)
+
+        if status_response.status_code != 200:
+            return jsonify({
+                "error": f"Failed to get batch status: {status_response.status_code}",
+                "details": status_response.text[:500]
+            }), 400
+
+        batch_status = status_response.json()
+        state = batch_status.get("metadata", {}).get("state", "")
+
+        if state != "BATCH_STATE_SUCCEEDED":
+            # 배치가 아직 완료되지 않았거나 실패
+            return jsonify({
+                "success": False,
+                "state": state,
+                "message": f"Batch not ready: {state}"
+            })
+
+        # batch_jobs에서 메타데이터 조회
+        success, jobs = supabase_request(
+            "GET",
+            f"batch_jobs?id=eq.{job_id}&select=*",
+            supabase_url, supabase_key
+        )
+
+        if not success or not jobs:
+            return jsonify({"error": f"Job {job_id} not found"}), 404
+
+        job = jobs[0]
+        chunk_metadata = job.get("chunk_metadata", [])
+        product_map = job.get("product_map", {})
+        job_config = job.get("config", {})
+
+        # config 병합 (요청 config이 우선)
+        merged_config = {**job_config, **config}
+
+        # 결과 파일명 추출
+        responses_file = batch_status.get("response", {}).get("responsesFile", "")
+
+        if not responses_file:
+            return jsonify({"error": "No responsesFile in batch status"}), 400
+
+        # 결과 처리 (v2)
+        result = process_batch_results_v2(
+            gemini_file_name=responses_file,
+            gemini_api_key=gemini_api_key,
+            chunk_metadata=chunk_metadata,
+            product_map=product_map,
+            config=merged_config,
+            job_id=job_id,
+            validate_chunk_func=validate_chunk,
+            validate_translation_func=validate_translation_language,
+            base64_to_image_func=base64_to_image,
+            image_to_base64_func=image_to_base64,
+            merge_images_func=merge_images
+        )
+
+        # batch_jobs 상태 업데이트
+        if result.get("needs_retry"):
+            # 재처리 필요
+            supabase_request(
+                "PATCH",
+                f"batch_jobs?id=eq.{job_id}",
+                supabase_url, supabase_key,
+                {"status": "partial", "gemini_batch_state": "BATCH_STATE_SUCCEEDED"}
+            )
+        elif result.get("completed_images") == result.get("total_images"):
+            # 모두 완료
+            supabase_request(
+                "PATCH",
+                f"batch_jobs?id=eq.{job_id}",
+                supabase_url, supabase_key,
+                {
+                    "status": "completed",
+                    "gemini_batch_state": "BATCH_STATE_SUCCEEDED",
+                    "completed_at": datetime.now().isoformat()
+                }
+            )
+
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f"[Webhook] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/batch-progress/<int:batch_id>", methods=["GET"])
+def batch_progress(batch_id):
+    """
+    배치 진행 상황 조회
+
+    Returns:
+        batch_job_id: 배치 ID
+        total_images: 전체 이미지 수
+        completed: 완료된 이미지 수
+        partial: 일부 완료 (재처리 대기)
+        processing: 처리 중
+        failed: 실패
+        is_complete: 모두 완료 여부
+        images: 이미지별 상세 정보
+    """
+    try:
+        supabase_url = request.args.get("supabase_url") or SUPABASE_URL
+        supabase_key = request.args.get("supabase_key") or SUPABASE_SERVICE_KEY
+
+        if not supabase_url or not supabase_key:
+            return jsonify({"error": "Supabase credentials required"}), 400
+
+        progress = get_batch_progress(batch_id, supabase_url, supabase_key)
+        return jsonify(progress)
+
+    except Exception as e:
+        logger.error(f"[Progress] Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/create-retry-batch", methods=["POST"])
+def create_retry_batch_endpoint():
+    """
+    실패한 청크들로 재처리 배치 생성
+
+    Request:
+        batch_job_id: 원본 배치 ID
+        config: 설정 (geminiApiKey, geminiModel, prompt 등)
+
+    Returns:
+        success: 성공 여부
+        retry_batch_name: 새 Gemini 배치 이름
+        chunks_count: 재처리 청크 수
+    """
+    try:
+        data = request.get_json() or {}
+
+        batch_job_id = data.get("batch_job_id")
+        config = data.get("config", {})
+
+        if not batch_job_id:
+            return jsonify({"error": "batch_job_id required"}), 400
+
+        supabase_url = config.get("supabaseUrl") or SUPABASE_URL
+        supabase_key = config.get("supabaseKey") or SUPABASE_SERVICE_KEY
+        gemini_api_key = config.get("geminiApiKey")
+        prompt = config.get("prompt", "Translate the text in this image.")
+        gemini_model = config.get("geminiModel", "gemini-3-pro-image-preview")
+
+        if not gemini_api_key:
+            return jsonify({"error": "geminiApiKey required"}), 400
+
+        # 재처리 대상 청크 조회
+        success, invalid_chunks = get_invalid_chunks_for_retry(
+            batch_job_id, supabase_url, supabase_key
+        )
+
+        if not success:
+            return jsonify({"error": str(invalid_chunks)}), 500
+
+        if not invalid_chunks:
+            return jsonify({
+                "success": True,
+                "message": "No chunks to retry",
+                "chunks_count": 0
+            })
+
+        logger.info(f"[RetryBatch] Found {len(invalid_chunks)} chunks to retry for job {batch_job_id}")
+
+        # 3회 초과 청크는 원본으로 대체
+        chunks_to_retry = []
+        replaced_chunks = []
+
+        for chunk in invalid_chunks:
+            if chunk.get("retry_count", 0) >= MAX_RETRY_COUNT:
+                # 3회 실패 → 원본으로 대체
+                update_chunk_status(
+                    chunk["id"], "replaced",
+                    supabase_url, supabase_key
+                )
+                replaced_chunks.append(chunk["id"])
+            else:
+                chunks_to_retry.append(chunk)
+
+        if not chunks_to_retry:
+            # 모두 원본으로 대체됨 → 이미지 완료 체크
+            complete_result = check_and_complete_images(
+                batch_job_id, config,
+                base64_to_image, image_to_base64, merge_images
+            )
+            return jsonify({
+                "success": True,
+                "message": "All chunks replaced with originals",
+                "replaced_count": len(replaced_chunks),
+                "completed_images": complete_result.get("completed", 0)
+            })
+
+        # Gemini 배치 요청 생성
+        import tempfile
+        import time
+
+        batch_requests = []
+        chunk_ids = []
+
+        for chunk in chunks_to_retry:
+            if not chunk.get("original_base64"):
+                logger.warning(f"[RetryBatch] Chunk {chunk['id']} has no original_base64")
+                continue
+
+            custom_id = f"retry_{batch_job_id}_{chunk['id']}_{int(time.time())}"
+
+            batch_requests.append({
+                "key": custom_id,
+                "request": {
+                    "model": gemini_model,
+                    "contents": [{
+                        "parts": [
+                            {"text": prompt},
+                            {
+                                "inlineData": {
+                                    "mimeType": "image/png",
+                                    "data": chunk["original_base64"]
+                                }
+                            }
+                        ]
+                    }],
+                    "generationConfig": {
+                        "responseModalities": ["image", "text"],
+                        "responseMimeType": "image/png"
+                    }
+                }
+            })
+            chunk_ids.append(chunk["id"])
+
+        if not batch_requests:
+            return jsonify({
+                "success": False,
+                "error": "No valid chunks to retry"
+            })
+
+        # JSONL 파일 생성
+        jsonl_content = "\n".join(json.dumps(req) for req in batch_requests)
+
+        temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False)
+        temp_file.write(jsonl_content)
+        temp_file.close()
+
+        try:
+            # Gemini 파일 업로드
+            with open(temp_file.name, 'rb') as f:
+                upload_response = requests.post(
+                    "https://generativelanguage.googleapis.com/upload/v1beta/files",
+                    headers={"x-goog-api-key": gemini_api_key},
+                    files={"file": ("retry_batch.jsonl", f, "application/jsonl")},
+                    timeout=120
+                )
+
+            if upload_response.status_code != 200:
+                return jsonify({
+                    "error": f"File upload failed: {upload_response.status_code}",
+                    "details": upload_response.text[:500]
+                }), 400
+
+            file_info = upload_response.json()
+            file_uri = file_info.get("file", {}).get("uri")
+
+            if not file_uri:
+                return jsonify({"error": "No file URI in response"}), 400
+
+            # 배치 작업 생성
+            batch_response = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:batchGenerateContent",
+                headers={
+                    "x-goog-api-key": gemini_api_key,
+                    "Content-Type": "application/json"
+                },
+                json={"requests_file": file_uri},
+                timeout=60
+            )
+
+            if batch_response.status_code != 200:
+                return jsonify({
+                    "error": f"Batch creation failed: {batch_response.status_code}",
+                    "details": batch_response.text[:500]
+                }), 400
+
+            batch_info = batch_response.json()
+            batch_name = batch_info.get("name", "")
+
+            # 청크 상태를 retrying으로 업데이트
+            for chunk_id in chunk_ids:
+                update_chunk_status(
+                    chunk_id, "retrying",
+                    supabase_url, supabase_key,
+                    increment_retry=True
+                )
+
+            # batch_jobs에 재처리 배치 정보 기록
+            supabase_request(
+                "PATCH",
+                f"batch_jobs?id=eq.{batch_job_id}",
+                supabase_url, supabase_key,
+                {
+                    "retry_batch_name": batch_name,
+                    "retry_count": len(chunk_ids)
+                }
+            )
+
+            return jsonify({
+                "success": True,
+                "retry_batch_name": batch_name,
+                "chunks_count": len(chunk_ids),
+                "replaced_count": len(replaced_chunks),
+                "chunk_ids": chunk_ids
+            })
+
+        finally:
+            os.unlink(temp_file.name)
+
+    except Exception as e:
+        logger.error(f"[RetryBatch] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/process-retry-results", methods=["POST"])
+def process_retry_results_endpoint():
+    """
+    재처리 배치 결과 처리
+
+    Request:
+        batch_job_id: 원본 배치 ID
+        retry_batch_name: 재처리 Gemini 배치 이름
+        config: 설정
+
+    Returns:
+        success: 성공 여부
+        valid_count: 검증 통과 청크 수
+        invalid_count: 검증 실패 청크 수
+        needs_more_retry: 추가 재처리 필요 여부
+    """
+    try:
+        data = request.get_json() or {}
+
+        batch_job_id = data.get("batch_job_id")
+        retry_batch_name = data.get("retry_batch_name")
+        config = data.get("config", {})
+
+        if not batch_job_id or not retry_batch_name:
+            return jsonify({"error": "batch_job_id and retry_batch_name required"}), 400
+
+        supabase_url = config.get("supabaseUrl") or SUPABASE_URL
+        supabase_key = config.get("supabaseKey") or SUPABASE_SERVICE_KEY
+        gemini_api_key = config.get("geminiApiKey")
+        target_lang_code = config.get("targetLangCode", "en")
+
+        if not gemini_api_key:
+            return jsonify({"error": "geminiApiKey required"}), 400
+
+        # Gemini 배치 상태 확인
+        status_url = f"https://generativelanguage.googleapis.com/v1beta/{retry_batch_name}?key={gemini_api_key}"
+        status_response = requests.get(status_url, timeout=30)
+
+        if status_response.status_code != 200:
+            return jsonify({
+                "error": f"Failed to get batch status: {status_response.status_code}"
+            }), 400
+
+        batch_status = status_response.json()
+        state = batch_status.get("metadata", {}).get("state", "")
+
+        if state != "BATCH_STATE_SUCCEEDED":
+            return jsonify({
+                "success": False,
+                "state": state,
+                "message": f"Retry batch not ready: {state}"
+            })
+
+        # 결과 파일 다운로드
+        responses_file = batch_status.get("response", {}).get("responsesFile", "")
+
+        if not responses_file:
+            return jsonify({"error": "No responsesFile in batch status"}), 400
+
+        download_url = f"https://generativelanguage.googleapis.com/download/v1beta/{responses_file}:download?alt=media"
+        download_response = requests.get(
+            download_url,
+            headers={"x-goog-api-key": gemini_api_key},
+            timeout=300
+        )
+
+        if download_response.status_code != 200:
+            return jsonify({
+                "error": f"Failed to download results: {download_response.status_code}"
+            }), 400
+
+        # JSONL 파싱 및 청크 업데이트
+        lines = download_response.text.strip().split('\n')
+        valid_count = 0
+        invalid_count = 0
+
+        for line in lines:
+            if not line.strip():
+                continue
+
+            try:
+                response_data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            custom_id = response_data.get("key", "")
+
+            # custom_id 형식: retry_{batch_job_id}_{chunk_id}_{timestamp}
+            parts = custom_id.split("_")
+            if len(parts) < 3:
+                continue
+
+            chunk_id = int(parts[2])
+
+            # 이미지 데이터 추출
+            translated_base64 = None
+            candidates = response_data.get("response", {}).get("candidates", [])
+
+            if candidates and candidates[0].get("content", {}).get("parts"):
+                for part in candidates[0]["content"]["parts"]:
+                    inline_data = part.get("inline_data") or part.get("inlineData")
+                    if inline_data and inline_data.get("data"):
+                        translated_base64 = inline_data["data"]
+                        break
+
+            if not translated_base64:
+                update_chunk_status(
+                    chunk_id, "invalid",
+                    supabase_url, supabase_key,
+                    last_error="No image data in retry response"
+                )
+                invalid_count += 1
+                continue
+
+            # OCR 검증
+            try:
+                ocr_result = validate_translation_language(
+                    translated_base64, target_lang_code, threshold=0.2
+                )
+            except Exception as ocr_err:
+                ocr_result = {"valid": True, "reason": f"OCR error: {str(ocr_err)}"}
+
+            if ocr_result.get("valid", False):
+                update_chunk_status(
+                    chunk_id, "valid",
+                    supabase_url, supabase_key,
+                    translated_base64=translated_base64,
+                    validation_result=ocr_result
+                )
+                valid_count += 1
+            else:
+                update_chunk_status(
+                    chunk_id, "invalid",
+                    supabase_url, supabase_key,
+                    validation_result=ocr_result,
+                    last_error=ocr_result.get("reason", "OCR validation failed")
+                )
+                invalid_count += 1
+
+        # 완료 가능한 이미지 체크 및 병합
+        complete_result = check_and_complete_images(
+            batch_job_id, config,
+            base64_to_image, image_to_base64, merge_images
+        )
+
+        # 추가 재처리 필요 여부 확인
+        success, remaining_invalid = get_invalid_chunks_for_retry(
+            batch_job_id, supabase_url, supabase_key
+        )
+        needs_more_retry = success and len(remaining_invalid) > 0
+
+        # 진행 상황 업데이트
+        progress = get_batch_progress(batch_job_id, supabase_url, supabase_key)
+
+        # 모두 완료되었으면 batch_jobs 상태 업데이트
+        if progress.get("is_complete"):
+            from datetime import datetime
+            supabase_request(
+                "PATCH",
+                f"batch_jobs?id=eq.{batch_job_id}",
+                supabase_url, supabase_key,
+                {
+                    "status": "completed",
+                    "completed_at": datetime.now().isoformat()
+                }
+            )
+
+        return jsonify({
+            "success": True,
+            "valid_count": valid_count,
+            "invalid_count": invalid_count,
+            "completed_images": complete_result.get("completed", 0),
+            "needs_more_retry": needs_more_retry,
+            "remaining_invalid": len(remaining_invalid) if success else 0,
+            "progress": progress
+        })
+
+    except Exception as e:
+        logger.error(f"[RetryResults] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/complete-batch/<int:batch_id>", methods=["POST"])
+def complete_batch(batch_id):
+    """
+    배치 완료 처리 및 상품 테이블 업데이트
+
+    모든 이미지가 completed 상태일 때 호출
+    각 상품의 translated_image 필드를 업데이트합니다.
+    """
+    try:
+        data = request.get_json() or {}
+        config = data.get("config", {})
+
+        supabase_url = config.get("supabaseUrl") or SUPABASE_URL
+        supabase_key = config.get("supabaseKey") or SUPABASE_SERVICE_KEY
+        table_name = config.get("tableName", "")
+
+        if not table_name:
+            return jsonify({"error": "tableName required in config"}), 400
+
+        # 진행 상황 확인
+        progress = get_batch_progress(batch_id, supabase_url, supabase_key)
+
+        if not progress.get("is_complete"):
+            return jsonify({
+                "success": False,
+                "message": "Batch not complete yet",
+                "progress": progress
+            })
+
+        # 상품별 이미지 URL 수집
+        product_urls = {}
+
+        for img in progress.get("images", []):
+            if img["status"] != "completed":
+                continue
+
+            product_id = img["product_id"]
+
+            # merged_url 조회
+            success, img_records = supabase_request(
+                "GET",
+                f"image_processing?id=eq.{img['id']}&select=merged_url",
+                supabase_url, supabase_key
+            )
+
+            if success and img_records and img_records[0].get("merged_url"):
+                if product_id not in product_urls:
+                    product_urls[product_id] = []
+
+                product_urls[product_id].append({
+                    "index": img["image_index"],
+                    "url": img_records[0]["merged_url"]
+                })
+
+        # 상품별 업데이트
+        updated_products = []
+
+        for product_id, urls in product_urls.items():
+            # 인덱스 순 정렬
+            sorted_urls = [u["url"] for u in sorted(urls, key=lambda x: x["index"])]
+
+            # 상품 테이블 업데이트
+            success, result = supabase_request(
+                "PATCH",
+                f"{table_name}?id=eq.{product_id}",
+                supabase_url, supabase_key,
+                {"translated_image": sorted_urls}
+            )
+
+            if success:
+                updated_products.append(product_id)
+
+        # batch_jobs 완료 처리
+        from datetime import datetime
+        supabase_request(
+            "PATCH",
+            f"batch_jobs?id=eq.{batch_id}",
+            supabase_url, supabase_key,
+            {
+                "status": "completed",
+                "completed_at": datetime.now().isoformat()
+            }
+        )
+
+        return jsonify({
+            "success": True,
+            "updated_products": updated_products,
+            "total_products": len(updated_products)
+        })
+
+    except Exception as e:
+        logger.error(f"[CompleteBatch] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+# datetime import 추가 (파일 상단에 없으면)
+from datetime import datetime
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
-    logger.info(f"Starting Text Render Service v9 on port {port}")
-    logger.info(f"Features: slice, merge, batch-results, translate-chunks, prepare-batch")
+    logger.info(f"Starting Text Render Service v10 on port {port}")
+    logger.info(f"Features: slice, merge, batch-results-v2, retry-batch, webhook")
     logger.info(f"Vertex AI available: {vertex_ai_available}")
     app.run(host="0.0.0.0", port=port, debug=True)
