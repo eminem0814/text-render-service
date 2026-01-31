@@ -2773,35 +2773,44 @@ def process_batch_results():
                 enable_ocr_validation = config.get("enableOcrValidation", True)
                 ocr_validation_result = None
 
-                # 병합된 이미지 높이 계산 (OCR 크기 제한용)
-                merged_image_height = sum(c.get("height", 0) for c in sorted_chunks)
-                MAX_OCR_HEIGHT = 5000  # OCR 검증 최대 높이 제한 (메모리 보호)
-
                 if enable_ocr_validation:
-                    # 이미지가 너무 크면 OCR 스킵 (메모리 보호)
-                    if merged_image_height > MAX_OCR_HEIGHT:
-                        logger.info(f"[OCR 스킵] {image_key}: 이미지 높이 {merged_image_height}px > {MAX_OCR_HEIGHT}px 제한")
-                        ocr_validation_result = {
-                            "valid": True,
-                            "reason": f"이미지 크기 초과로 OCR 스킵 (높이: {merged_image_height}px)",
-                            "skipped": True
-                        }
-                    else:
-                        try:
-                            ocr_validation_result = validate_translation_language(
-                                merged_base64,
-                                target_lang_code,
-                                threshold=0.2  # 비타겟 언어 20% 이상이면 불량
-                            )
+                    try:
+                        # OCR용 이미지 준비 (대형 이미지는 리사이즈)
+                        MAX_OCR_HEIGHT = 4000  # OCR 검증 최대 높이 (메모리 보호)
 
-                            if ocr_validation_result["valid"]:
-                                logger.info(f"[OCR 검증 통과] {image_key}: 타겟 언어 비율 {ocr_validation_result.get('target_lang_ratio', 0):.1%}")
-                            else:
-                                logger.warning(f"[OCR 검증 실패] {image_key}: {ocr_validation_result['reason']}")
-                                validation_stats["translation_defects"] = validation_stats.get("translation_defects", 0) + 1
-                        except Exception as ocr_err:
-                            logger.warning(f"[OCR 검증 오류] {image_key}: {ocr_err} - 검증 스킵")
-                            ocr_validation_result = {"valid": True, "reason": f"검증 오류로 통과 처리: {str(ocr_err)}"}
+                        # 병합된 이미지 디코딩
+                        ocr_image = base64_to_image(merged_base64)
+                        ocr_width, ocr_height = ocr_image.size
+
+                        # 이미지가 너무 크면 리사이즈
+                        if ocr_height > MAX_OCR_HEIGHT:
+                            scale_ratio = MAX_OCR_HEIGHT / ocr_height
+                            new_width = int(ocr_width * scale_ratio)
+                            ocr_image = ocr_image.resize((new_width, MAX_OCR_HEIGHT), Image.Resampling.LANCZOS)
+                            logger.info(f"[OCR 리사이즈] {image_key}: {ocr_width}x{ocr_height} → {new_width}x{MAX_OCR_HEIGHT}")
+
+                        # 리사이즈된 이미지를 base64로 변환 (OCR용)
+                        ocr_base64, _ = image_to_base64(ocr_image, format="JPEG", quality=85)
+
+                        # 메모리 해제
+                        del ocr_image
+
+                        # OCR 검증 수행
+                        ocr_validation_result = validate_translation_language(
+                            ocr_base64,
+                            target_lang_code,
+                            threshold=0.2  # 비타겟 언어 20% 이상이면 불량
+                        )
+
+                        if ocr_validation_result["valid"]:
+                            logger.info(f"[OCR 검증 통과] {image_key}: 타겟 언어 비율 {ocr_validation_result.get('target_lang_ratio', 0):.1%}")
+                        else:
+                            logger.warning(f"[OCR 검증 실패] {image_key}: {ocr_validation_result['reason']}")
+                            validation_stats["translation_defects"] = validation_stats.get("translation_defects", 0) + 1
+
+                    except Exception as ocr_err:
+                        logger.warning(f"[OCR 검증 오류] {image_key}: {ocr_err} - 검증 스킵")
+                        ocr_validation_result = {"valid": True, "reason": f"검증 오류로 통과 처리: {str(ocr_err)}"}
                 # ===== OCR 검증 끝 =====
 
                 # Supabase Storage 업로드
