@@ -3832,16 +3832,63 @@ def create_retry_batch_endpoint():
                 "completed_images": complete_result.get("completed", 0)
             })
 
+        # batch_jobs에서 batch_id 조회 (Storage 경로용)
+        from batch_processor import supabase_request as bp_supabase_request
+        success, jobs = bp_supabase_request(
+            "GET",
+            f"batch_jobs?id=eq.{batch_job_id}&select=batch_id,chunk_metadata",
+            supabase_url, supabase_key
+        )
+
+        storage_batch_id = ""
+        chunk_meta_map = {}
+        if success and jobs:
+            storage_batch_id = jobs[0].get("batch_id", "")
+            chunk_metadata = jobs[0].get("chunk_metadata", [])
+            # chunk key -> metadata 매핑
+            for meta in chunk_metadata:
+                chunk_meta_map[f"{meta.get('productId')}_{meta.get('imageIndex')}_{meta.get('chunkIndex')}"] = meta
+
+        logger.info(f"[RetryBatch] Storage batch_id: {storage_batch_id}")
+
         # Gemini 배치 요청 생성
         import tempfile
         import time
 
         batch_requests = []
         chunk_ids = []
+        skipped_no_data = 0
 
         for chunk in chunks_to_retry:
-            if not chunk.get("original_base64"):
-                logger.warning(f"[RetryBatch] Chunk {chunk['id']} has no original_base64")
+            original_b64 = chunk.get("original_base64", "")
+
+            # original_base64가 없으면 Storage에서 가져오기
+            if not original_b64 and storage_batch_id:
+                # 청크 키 구성: p{productId}_i{imageIndex}_c{chunkIndex}
+                img_info = chunk.get("image_processing", {})
+                product_id = img_info.get("product_id")
+                image_index = img_info.get("image_index")
+                chunk_index = chunk.get("chunk_index")
+
+                if product_id is not None and image_index is not None and chunk_index is not None:
+                    chunk_key = f"p{product_id}_i{image_index}_c{chunk_index}"
+                    logger.info(f"[RetryBatch] Fetching from storage: {chunk_key}")
+
+                    # Storage에서 원본 가져오기
+                    original_result = get_original_chunk(
+                        chunk_key=chunk_key,
+                        batch_id=storage_batch_id,
+                        supabase_url=supabase_url,
+                        supabase_key=supabase_key
+                    )
+
+                    if original_result.get("success"):
+                        original_b64 = original_result.get("base64", "")
+                        logger.info(f"[RetryBatch] Fetched {chunk_key} from storage: {len(original_b64)} chars")
+
+            if not original_b64:
+                logger.warning(f"[RetryBatch] Chunk {chunk['id']} has no original_base64 and not in storage")
+                skipped_no_data += 1
                 continue
 
             custom_id = f"retry_{batch_job_id}_{chunk['id']}_{int(time.time())}"
@@ -3856,7 +3903,7 @@ def create_retry_batch_endpoint():
                             {
                                 "inlineData": {
                                     "mimeType": "image/png",
-                                    "data": chunk["original_base64"]
+                                    "data": original_b64
                                 }
                             }
                         ]
@@ -3872,7 +3919,9 @@ def create_retry_batch_endpoint():
         if not batch_requests:
             return jsonify({
                 "success": False,
-                "error": "No valid chunks to retry"
+                "error": "No valid chunks to retry",
+                "skipped_no_data": skipped_no_data,
+                "total_chunks_found": len(chunks_to_retry)
             })
 
         # JSONL 파일 생성
