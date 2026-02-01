@@ -3898,21 +3898,14 @@ def create_retry_batch_endpoint():
             batch_requests.append({
                 "key": custom_id,
                 "request": {
-                    "model": gemini_model,
                     "contents": [{
                         "parts": [
                             {"text": prompt},
-                            {
-                                "inlineData": {
-                                    "mimeType": "image/png",
-                                    "data": original_b64
-                                }
-                            }
+                            {"inline_data": {"mime_type": "image/jpeg", "data": original_b64}}
                         ]
                     }],
-                    "generationConfig": {
-                        "responseModalities": ["image", "text"],
-                        "responseMimeType": "image/png"
+                    "generation_config": {
+                        "response_modalities": ["TEXT", "IMAGE"]
                     }
                 }
             })
