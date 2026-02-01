@@ -3956,13 +3956,21 @@ def create_retry_batch_endpoint():
                 return jsonify({"error": "No file URI in response"}), 400
 
             # 배치 작업 생성
+            file_name = file_info.get("file", {}).get("name")
+            retry_batch_display_name = f"retry-{batch_job_id}-{int(time.time())}"
+
             batch_response = requests.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:batchGenerateContent",
                 headers={
                     "x-goog-api-key": gemini_api_key,
                     "Content-Type": "application/json"
                 },
-                json={"requests_file": file_uri},
+                json={
+                    "batch": {
+                        "display_name": retry_batch_display_name,
+                        "input_config": {"file_name": file_name}
+                    }
+                },
                 timeout=60
             )
 
