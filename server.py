@@ -3832,24 +3832,26 @@ def create_retry_batch_endpoint():
                 "completed_images": complete_result.get("completed", 0)
             })
 
-        # batch_jobs에서 batch_id 조회 (Storage 경로용)
+        # batch_jobs에서 chunk_metadata 조회 (batchId는 chunk_metadata 안에 있음)
         from batch_processor import supabase_request as bp_supabase_request
         success, jobs = bp_supabase_request(
             "GET",
-            f"batch_jobs?id=eq.{batch_job_id}&select=batch_id,chunk_metadata",
+            f"batch_jobs?id=eq.{batch_job_id}&select=chunk_metadata",
             supabase_url, supabase_key
         )
 
         storage_batch_id = ""
         chunk_meta_map = {}
         if success and jobs:
-            storage_batch_id = jobs[0].get("batch_id", "")
             chunk_metadata = jobs[0].get("chunk_metadata", [])
-            # chunk key -> metadata 매핑
+            # chunk key -> metadata 매핑 & batchId 추출
             for meta in chunk_metadata:
                 chunk_meta_map[f"{meta.get('productId')}_{meta.get('imageIndex')}_{meta.get('chunkIndex')}"] = meta
+                # batchId는 모든 청크에 동일하므로 첫 번째에서 추출
+                if not storage_batch_id and meta.get("batchId"):
+                    storage_batch_id = meta.get("batchId")
 
-        logger.info(f"[RetryBatch] Storage batch_id: {storage_batch_id}")
+        logger.info(f"[RetryBatch] Storage batch_id from chunk_metadata: {storage_batch_id}")
 
         # Gemini 배치 요청 생성
         import tempfile
