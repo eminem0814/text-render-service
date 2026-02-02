@@ -4679,10 +4679,13 @@ def merge_and_save_image():
 @app.route("/record-defective-chunks", methods=["POST"])
 def record_defective_chunks():
     """
-    불량 청크들을 DB에 기록 (n8n 루프용)
+    불량 청크 + 정상 청크를 DB에 기록 (n8n 루프용)
 
-    각 이미지 처리 후 불량 청크를 chunk_processing 테이블에 기록
-    모든 이미지 처리 완료 후 일괄 재처리 배치 생성에 사용
+    불량이 있는 이미지의 모든 청크를 DB에 저장
+    - 불량 청크: status='invalid', 재처리 대상
+    - 정상 청크: status='valid', translated_base64 보관
+
+    재처리 완료 후 정상 청크 + 재처리된 청크를 합쳐서 병합
 
     Request:
         batch_job_id: 배치 작업 ID
@@ -4690,11 +4693,15 @@ def record_defective_chunks():
         product_id: 상품 ID
         image_index: 이미지 인덱스
         defective_chunks: [{index, key, reason, defect_type, can_retry}, ...]
+        valid_chunks: [{index, key, base64}, ...]  # 정상 청크 (보관용)
+        total_chunks: 전체 청크 수
         storage_batch_id: 원본 청크 저장 배치 ID (Storage 경로용)
         config: {supabase_url, supabase_key}
 
     Response:
         recorded_count: 기록된 청크 수
+        valid_count: 정상 청크 수
+        invalid_count: 불량 청크 수
     """
     try:
         data = request.get_json()
@@ -4704,16 +4711,21 @@ def record_defective_chunks():
         product_id = data.get("product_id")
         image_index = data.get("image_index")
         defective_chunks = data.get("defective_chunks", [])
+        valid_chunks = data.get("valid_chunks", [])
+        total_chunks = data.get("total_chunks", len(defective_chunks) + len(valid_chunks))
         storage_batch_id = data.get("storage_batch_id")
         config = data.get("config", {})
 
-        if not batch_job_id or not defective_chunks:
-            return jsonify({"error": "batch_job_id and defective_chunks required"}), 400
+        if not batch_job_id:
+            return jsonify({"error": "batch_job_id required"}), 400
+
+        if not defective_chunks and not valid_chunks:
+            return jsonify({"error": "defective_chunks or valid_chunks required"}), 400
 
         supabase_url = config.get("supabase_url") or SUPABASE_URL
         supabase_key = config.get("supabase_key") or SUPABASE_SERVICE_KEY
 
-        logger.info(f"[RecordDefective] Recording {len(defective_chunks)} defective chunks for {image_key}")
+        logger.info(f"[RecordChunks] Recording {len(defective_chunks)} defective + {len(valid_chunks)} valid chunks for {image_key}")
 
         # 1. image_processing 레코드 확인/생성
         success, ip_result = supabase_request(
@@ -4724,6 +4736,18 @@ def record_defective_chunks():
 
         if success and ip_result:
             image_processing_id = ip_result[0]["id"]
+            # 상태 업데이트
+            supabase_request(
+                "PATCH",
+                f"image_processing?id=eq.{image_processing_id}",
+                supabase_url, supabase_key,
+                {
+                    "status": "partial",
+                    "total_chunks": total_chunks,
+                    "valid_chunks": len(valid_chunks),
+                    "invalid_chunks": len(defective_chunks)
+                }
+            )
         else:
             # 새로 생성
             success, ip_result = supabase_request(
@@ -4735,6 +4759,8 @@ def record_defective_chunks():
                     "product_id": product_id,
                     "image_index": image_index,
                     "status": "partial",
+                    "total_chunks": total_chunks,
+                    "valid_chunks": len(valid_chunks),
                     "invalid_chunks": len(defective_chunks)
                 }
             )
@@ -4742,8 +4768,9 @@ def record_defective_chunks():
                 return jsonify({"error": f"Failed to create image_processing: {ip_result}"}), 500
             image_processing_id = ip_result[0]["id"] if isinstance(ip_result, list) else ip_result.get("id")
 
-        # 2. 각 불량 청크를 chunk_processing에 기록
         recorded_count = 0
+
+        # 2. 불량 청크 기록
         for chunk in defective_chunks:
             chunk_index = chunk.get("index")
             chunk_key = chunk.get("key")
@@ -4773,7 +4800,6 @@ def record_defective_chunks():
             }
 
             if existing:
-                # 업데이트
                 chunk_id = existing[0]["id"]
                 supabase_request(
                     "PATCH",
@@ -4782,7 +4808,6 @@ def record_defective_chunks():
                     chunk_data
                 )
             else:
-                # 새로 생성
                 chunk_data.update({
                     "image_processing_id": image_processing_id,
                     "chunk_index": chunk_index,
@@ -4798,17 +4823,64 @@ def record_defective_chunks():
 
             recorded_count += 1
 
-        logger.info(f"[RecordDefective] Recorded {recorded_count} chunks")
+        # 3. 정상 청크도 기록 (translated_base64 보관)
+        for chunk in valid_chunks:
+            chunk_index = chunk.get("index")
+            chunk_key = chunk.get("key")
+            translated_base64 = chunk.get("base64", "")
+
+            # 기존 레코드 확인
+            success, existing = supabase_request(
+                "GET",
+                f"chunk_processing?image_processing_id=eq.{image_processing_id}&chunk_index=eq.{chunk_index}",
+                supabase_url, supabase_key
+            )
+
+            chunk_data = {
+                "status": "valid",
+                "translated_base64": translated_base64,
+                "validation_result": {
+                    "valid": True,
+                    "reason": chunk.get("reason", "검증 통과")
+                }
+            }
+
+            if existing:
+                chunk_id = existing[0]["id"]
+                supabase_request(
+                    "PATCH",
+                    f"chunk_processing?id=eq.{chunk_id}",
+                    supabase_url, supabase_key,
+                    chunk_data
+                )
+            else:
+                chunk_data.update({
+                    "image_processing_id": image_processing_id,
+                    "chunk_index": chunk_index,
+                    "retry_count": 0
+                })
+                supabase_request(
+                    "POST",
+                    "chunk_processing",
+                    supabase_url, supabase_key,
+                    chunk_data
+                )
+
+            recorded_count += 1
+
+        logger.info(f"[RecordChunks] Recorded {recorded_count} chunks (valid: {len(valid_chunks)}, invalid: {len(defective_chunks)})")
 
         return jsonify({
             "success": True,
             "image_key": image_key,
             "recorded_count": recorded_count,
+            "valid_count": len(valid_chunks),
+            "invalid_count": len(defective_chunks),
             "image_processing_id": image_processing_id
         })
 
     except Exception as e:
-        logger.error(f"[RecordDefective] Error: {e}")
+        logger.error(f"[RecordChunks] Error: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
@@ -4904,10 +4976,328 @@ def get_all_defective_chunks():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/merge-image-from-db", methods=["POST"])
+def merge_image_from_db():
+    """
+    DB에 저장된 청크들을 가져와서 병합/저장 (재처리 완료 후 사용)
+
+    모든 청크가 valid 상태일 때 호출
+    chunk_processing 테이블에서 translated_base64를 가져와서 병합
+
+    Request:
+        image_processing_id: 이미지 처리 ID
+        config: {supabase_url, supabase_key, storage_bucket, ...}
+
+    Response:
+        success: 성공 여부
+        merged_url: 병합된 이미지 URL
+    """
+    try:
+        data = request.get_json()
+
+        image_processing_id = data.get("image_processing_id")
+        config = data.get("config", {})
+
+        if not image_processing_id:
+            return jsonify({"error": "image_processing_id required"}), 400
+
+        supabase_url = config.get("supabase_url") or SUPABASE_URL
+        supabase_key = config.get("supabase_key") or SUPABASE_SERVICE_KEY
+        storage_bucket = config.get("storage_bucket", "translated-images")
+        output_format = config.get("output_format", "WEBP").upper()
+        output_quality = int(config.get("output_quality", 100))
+        output_extension = config.get("output_extension", ".webp")
+
+        logger.info(f"[MergeFromDB] Merging image {image_processing_id}")
+
+        # 1. image_processing 정보 조회
+        success, ip_result = supabase_request(
+            "GET",
+            f"image_processing?id=eq.{image_processing_id}&select=*",
+            supabase_url, supabase_key
+        )
+
+        if not success or not ip_result:
+            return jsonify({"error": "image_processing not found"}), 404
+
+        ip_data = ip_result[0]
+        product_id = ip_data.get("product_id")
+        image_index = ip_data.get("image_index")
+
+        # 2. 모든 청크 조회
+        success, chunks = supabase_request(
+            "GET",
+            f"chunk_processing?image_processing_id=eq.{image_processing_id}&select=*&order=chunk_index",
+            supabase_url, supabase_key
+        )
+
+        if not success or not chunks:
+            return jsonify({"error": "No chunks found"}), 404
+
+        # 3. 모든 청크가 valid인지 확인
+        invalid_chunks = [c for c in chunks if c.get("status") != "valid"]
+        if invalid_chunks:
+            return jsonify({
+                "success": False,
+                "error": f"Not all chunks are valid. {len(invalid_chunks)} chunks still invalid.",
+                "invalid_count": len(invalid_chunks)
+            }), 400
+
+        # 4. 청크 데이터 준비
+        chunk_list = []
+        for chunk in chunks:
+            translated_base64 = chunk.get("translated_base64")
+            if not translated_base64:
+                return jsonify({
+                    "success": False,
+                    "error": f"Chunk {chunk['chunk_index']} has no translated_base64"
+                }), 400
+
+            chunk_list.append({
+                "index": chunk["chunk_index"],
+                "base64": translated_base64
+            })
+
+        # 5. 병합
+        sorted_chunks = sorted(chunk_list, key=lambda x: x["index"])
+
+        # 원본 너비 추정 (첫 번째 청크 기준)
+        original_width = None
+        if sorted_chunks:
+            first_chunk = sorted_chunks[0].get("base64")
+            if first_chunk:
+                try:
+                    img_bytes = base64.b64decode(first_chunk)
+                    img = Image.open(BytesIO(img_bytes))
+                    original_width = img.width
+                except:
+                    pass
+
+        merge_result = merge_images_internal(
+            sorted_chunks,
+            original_width or 800,
+            output_format=output_format,
+            output_quality=output_quality
+        )
+
+        if not merge_result["success"]:
+            return jsonify({
+                "success": False,
+                "error": f"병합 실패: {merge_result['error']}"
+            }), 400
+
+        # 6. Supabase Storage에 업로드
+        storage_path = f"{product_id}/{image_index}{output_extension}"
+
+        mime_types = {
+            "WEBP": "image/webp",
+            "JPEG": "image/jpeg",
+            "JPG": "image/jpeg",
+            "PNG": "image/png"
+        }
+        mime_type = mime_types.get(output_format, "image/webp")
+
+        upload_result = upload_to_supabase_storage(
+            merge_result["merged_base64"],
+            storage_path,
+            storage_bucket,
+            supabase_url,
+            supabase_key,
+            content_type=mime_type
+        )
+
+        if not upload_result["success"]:
+            return jsonify({
+                "success": False,
+                "error": f"업로드 실패: {upload_result['error']}"
+            }), 400
+
+        # 7. image_processing 상태 업데이트
+        supabase_request(
+            "PATCH",
+            f"image_processing?id=eq.{image_processing_id}",
+            supabase_url, supabase_key,
+            {
+                "status": "completed",
+                "merged_url": upload_result["url"]
+            }
+        )
+
+        logger.info(f"[MergeFromDB] Saved to: {upload_result['url']}")
+
+        return jsonify({
+            "success": True,
+            "image_processing_id": image_processing_id,
+            "product_id": product_id,
+            "image_index": image_index,
+            "merged_url": upload_result["url"],
+            "dimensions": {
+                "width": merge_result.get("width"),
+                "height": merge_result.get("height")
+            }
+        })
+
+    except Exception as e:
+        logger.error(f"[MergeFromDB] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/process-retry-result", methods=["POST"])
+def process_retry_result():
+    """
+    재처리 배치 결과 처리 (n8n 루프용)
+
+    재처리된 청크를 검증하고 DB 업데이트
+    모든 청크가 valid가 되면 병합/저장
+
+    Request:
+        image_key: 이미지 식별자
+        retry_chunks: 재처리된 청크 리스트 [{index, base64, key}, ...]
+        batch_job_id: 배치 작업 ID
+        target_lang: 타겟 언어
+        config: {supabase_url, supabase_key, storage_bucket, ...}
+
+    Response:
+        all_valid: 모든 청크가 정상인지
+        merged_url: 병합된 이미지 URL (모든 청크 정상 시)
+        still_invalid: 여전히 불량인 청크 수
+    """
+    try:
+        data = request.get_json()
+
+        image_key = data.get("image_key")
+        retry_chunks = data.get("retry_chunks", [])
+        batch_job_id = data.get("batch_job_id")
+        target_lang = data.get("target_lang", "en")
+        config = data.get("config", {})
+
+        if not image_key or not retry_chunks:
+            return jsonify({"error": "image_key and retry_chunks required"}), 400
+
+        supabase_url = config.get("supabase_url") or SUPABASE_URL
+        supabase_key = config.get("supabase_key") or SUPABASE_SERVICE_KEY
+
+        # image_key에서 product_id, image_index 추출
+        parts = image_key.split("_")
+        if len(parts) < 2:
+            return jsonify({"error": "Invalid image_key format"}), 400
+
+        product_id = int(parts[0])
+        image_index = int(parts[1])
+
+        logger.info(f"[ProcessRetryResult] Processing {len(retry_chunks)} retry chunks for {image_key}")
+
+        # 1. image_processing 조회
+        success, ip_result = supabase_request(
+            "GET",
+            f"image_processing?batch_job_id=eq.{batch_job_id}&product_id=eq.{product_id}&image_index=eq.{image_index}",
+            supabase_url, supabase_key
+        )
+
+        if not success or not ip_result:
+            return jsonify({"error": "image_processing not found"}), 404
+
+        image_processing_id = ip_result[0]["id"]
+
+        # 2. 재처리된 청크 검증 및 DB 업데이트
+        still_invalid = 0
+        for chunk in retry_chunks:
+            chunk_index = chunk.get("index")
+            chunk_base64 = chunk.get("base64")
+
+            if not chunk_base64:
+                still_invalid += 1
+                continue
+
+            # 검증
+            validation = validate_translated_chunk(
+                chunk_base64,
+                target_lang=target_lang,
+                skip_ocr=False
+            )
+
+            # DB 업데이트
+            if validation["valid"]:
+                supabase_request(
+                    "PATCH",
+                    f"chunk_processing?image_processing_id=eq.{image_processing_id}&chunk_index=eq.{chunk_index}",
+                    supabase_url, supabase_key,
+                    {
+                        "status": "valid",
+                        "translated_base64": chunk_base64,
+                        "validation_result": validation
+                    }
+                )
+            else:
+                still_invalid += 1
+                supabase_request(
+                    "PATCH",
+                    f"chunk_processing?image_processing_id=eq.{image_processing_id}&chunk_index=eq.{chunk_index}",
+                    supabase_url, supabase_key,
+                    {
+                        "status": "invalid",
+                        "validation_result": validation,
+                        "last_error": validation.get("reason")
+                    }
+                )
+
+        # 3. 모든 청크가 valid인지 확인
+        success, all_chunks = supabase_request(
+            "GET",
+            f"chunk_processing?image_processing_id=eq.{image_processing_id}&select=status",
+            supabase_url, supabase_key
+        )
+
+        invalid_count = len([c for c in (all_chunks or []) if c.get("status") != "valid"])
+        all_valid = invalid_count == 0
+
+        result = {
+            "success": True,
+            "image_key": image_key,
+            "all_valid": all_valid,
+            "still_invalid": invalid_count
+        }
+
+        # 4. 모든 청크가 정상이면 병합/저장
+        if all_valid:
+            merge_response = merge_image_from_db.__wrapped__(
+            ) if hasattr(merge_image_from_db, '__wrapped__') else None
+
+            # 직접 merge_image_from_db 로직 호출
+            from flask import Response
+            with app.test_request_context(json={
+                "image_processing_id": image_processing_id,
+                "config": config
+            }):
+                merge_result_response = merge_image_from_db()
+                if isinstance(merge_result_response, tuple):
+                    merge_data = merge_result_response[0].get_json()
+                else:
+                    merge_data = merge_result_response.get_json()
+
+                if merge_data.get("success"):
+                    result["merged_url"] = merge_data.get("merged_url")
+                    result["dimensions"] = merge_data.get("dimensions")
+                else:
+                    result["merge_error"] = merge_data.get("error")
+
+        logger.info(f"[ProcessRetryResult] {image_key}: all_valid={all_valid}, still_invalid={invalid_count}")
+
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f"[ProcessRetryResult] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
-    logger.info(f"Starting Text Render Service v10.1 on port {port}")
+    logger.info(f"Starting Text Render Service v10.2 on port {port}")
     logger.info(f"Features: slice, merge, batch-results-v2, retry-batch, webhook, n8n-loop-api")
-    logger.info(f"n8n Loop APIs: get-batch-images, validate-image-chunks, merge-and-save-image, record-defective-chunks, get-all-defective-chunks")
+    logger.info(f"n8n Loop APIs: get-batch-images, validate-image-chunks, merge-and-save-image, record-defective-chunks, get-all-defective-chunks, merge-image-from-db, process-retry-result")
     logger.info(f"Vertex AI available: {vertex_ai_available}")
     app.run(host="0.0.0.0", port=port, debug=True)
