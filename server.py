@@ -5123,7 +5123,21 @@ def merge_image_from_db():
             }
         )
 
-        logger.info(f"[MergeFromDB] Saved to: {upload_result['url']}")
+        # 8. 청크 데이터 정리 (메모리 절약)
+        # translated_base64, original_base64 필드를 null로 설정
+        chunk_ids = [c["id"] for c in chunks]
+        for chunk_id in chunk_ids:
+            supabase_request(
+                "PATCH",
+                f"chunk_processing?id=eq.{chunk_id}",
+                supabase_url, supabase_key,
+                {
+                    "translated_base64": None,
+                    "original_base64": None
+                }
+            )
+
+        logger.info(f"[MergeFromDB] Saved to: {upload_result['url']}, cleaned up {len(chunk_ids)} chunks")
 
         return jsonify({
             "success": True,
@@ -5131,6 +5145,7 @@ def merge_image_from_db():
             "product_id": product_id,
             "image_index": image_index,
             "merged_url": upload_result["url"],
+            "chunks_cleaned": len(chunk_ids),
             "dimensions": {
                 "width": merge_result.get("width"),
                 "height": merge_result.get("height")
