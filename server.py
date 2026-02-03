@@ -4476,6 +4476,8 @@ def get_batch_images():
         gemini_api_key = data.get("gemini_api_key")
         chunk_metadata = data.get("chunk_metadata", [])
         batch_job_id = data.get("batch_job_id")
+        limit = data.get("limit")  # 반환할 이미지 수 제한 (메모리 절약)
+        offset = data.get("offset", 0)  # 시작 위치
 
         if not gemini_file_name or not gemini_api_key:
             return jsonify({"error": "gemini_file_name and gemini_api_key required"}), 400
@@ -4564,17 +4566,33 @@ def get_batch_images():
             })
 
         # 이미지 리스트로 변환 (청크 정렬)
-        images = []
+        all_images = []
         for image_key, image_data in image_chunks.items():
             image_data["chunks"] = sorted(image_data["chunks"], key=lambda x: x["index"])
-            images.append(image_data)
+            all_images.append(image_data)
 
-        logger.info(f"[GetBatchImages] Grouped into {len(images)} images")
+        # 이미지 키 기준 정렬 (일관된 순서 보장)
+        all_images = sorted(all_images, key=lambda x: (x["product_id"], x["image_index"]))
+
+        total_images = len(all_images)
+        logger.info(f"[GetBatchImages] Grouped into {total_images} images")
+
+        # limit/offset 적용 (메모리 절약)
+        if limit is not None:
+            images = all_images[offset:offset + limit]
+            has_more = (offset + limit) < total_images
+            logger.info(f"[GetBatchImages] Returning {len(images)} images (offset={offset}, limit={limit}, has_more={has_more})")
+        else:
+            images = all_images
+            has_more = False
 
         return jsonify({
             "success": True,
             "images": images,
-            "total_images": len(images),
+            "total_images": total_images,
+            "returned_count": len(images),
+            "offset": offset,
+            "has_more": has_more,
             "batch_job_id": batch_job_id
         })
 
