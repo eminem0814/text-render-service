@@ -3498,32 +3498,29 @@ def prepare_batch():
                 for chunk_idx, chunk in enumerate(chunks):
                     request_key = f"p{img_req['productId']}_i{img_req['imageIndex']}_c{chunk_idx}"
 
-                    # 텍스트 유무 확인 (텍스트 없으면 Gemini 호출 불필요)
-                    chunk_has_text = has_text_in_image(chunk["base64"], min_chars=5)
+                    # OOM 방지: OCR 텍스트 감지 비활성화
+                    # 모든 청크를 Gemini에 전송하고, validation 단계에서만 OCR 사용
+                    chunk_has_text = True  # OCR 비활성화 - 모든 청크 처리
 
-                    if chunk_has_text:
-                        # 텍스트 있음 → Gemini 배치 요청 생성
-                        batch_request = {
-                            "key": request_key,
-                            "request": {
-                                "contents": [{
-                                    "parts": [
-                                        {"text": prompt},
-                                        {"inline_data": {"mime_type": "image/jpeg", "data": chunk["base64"]}}
-                                    ]
-                                }],
-                                "generation_config": {
-                                    "response_modalities": ["TEXT", "IMAGE"]
-                                }
+                    # 모든 청크 → Gemini 배치 요청 생성
+                    batch_request = {
+                        "key": request_key,
+                        "request": {
+                            "contents": [{
+                                "parts": [
+                                    {"text": prompt},
+                                    {"inline_data": {"mime_type": "image/jpeg", "data": chunk["base64"]}}
+                                ]
+                            }],
+                            "generation_config": {
+                                "response_modalities": ["TEXT", "IMAGE"]
                             }
                         }
+                    }
 
-                        # 파일에 직접 쓰기 (메모리 절약)
-                        temp_file.write(json.dumps(batch_request) + '\n')
-                        gemini_chunks += 1
-                    else:
-                        skipped_no_text += 1
-                        logger.info(f"[prepare-batch] 텍스트 없음 - Gemini 스킵: {request_key}")
+                    # 파일에 직접 쓰기 (메모리 절약)
+                    temp_file.write(json.dumps(batch_request) + '\n')
+                    gemini_chunks += 1
 
                     # 원본 청크 저장 (재처리용 - 텍스트 유무와 관계없이)
                     original_chunk_path = ""
