@@ -5338,6 +5338,7 @@ def process_retry_result():
         retry_chunks = data.get("retry_chunks", [])
         batch_job_id = data.get("batch_job_id")
         target_lang = data.get("target_lang", "en")
+        source_lang = data.get("source_lang")  # 원본 언어 (이중 검사용)
         config = data.get("config", {})
 
         if not image_key or not retry_chunks:
@@ -5378,10 +5379,11 @@ def process_retry_result():
                 still_invalid += 1
                 continue
 
-            # 검증
+            # 검증 (source_lang이 있으면 이중 검사)
             validation = validate_translated_chunk(
                 chunk_base64,
                 target_lang=target_lang,
+                source_lang=source_lang,
                 skip_ocr=False
             )
 
