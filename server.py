@@ -69,38 +69,60 @@ def get_ocr_reader(target_lang: str):
     대상 언어에 맞는 PaddleOCR Reader를 반환 (캐싱)
 
     Args:
-        target_lang: 대상 언어 코드 (예: 'en', 'ja', 'zh')
+        target_lang: 대상 언어 코드 (예: 'en', 'ja', 'zh', 'ko')
 
     Returns:
         PaddleOCR 객체
+
+    Note:
+        - 중국어(ch)/영어(en)/일본어(japan): PP-OCRv5_server_rec 사용 (고성능)
+        - 한국어(korean) 등 기타 언어: lang 파라미터만 사용 (언어별 전용 모델 자동 선택)
     """
     paddle_lang = LANGUAGE_CODE_MAP.get(target_lang, "en")
 
     if paddle_lang not in ocr_readers:
         try:
-            # PaddleOCR 3.x 초기화
-            # 참고: https://www.paddleocr.ai/latest/en/version3.x/pipeline_usage/OCR.html
             import logging
             logging.getLogger('ppocr').setLevel(logging.WARNING)
 
-            ocr_readers[paddle_lang] = PaddleOCR(
-                lang=paddle_lang,
-                # 균형 최적 모델: Detection Mobile (4.7MB) + Recognition Server (81MB)
-                text_detection_model_name="PP-OCRv5_mobile_det",
-                text_recognition_model_name="PP-OCRv5_server_rec",
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False,
-                # 대형 이미지 처리 - 내부적으로 최대 736px로 리사이즈 (속도 향상)
-                text_det_limit_side_len=736,
-                text_det_limit_type='max',
-                # 텍스트 감지 민감도 조정
-                text_det_box_thresh=0.5,
-                text_det_thresh=0.3,
-                text_det_unclip_ratio=1.6,
-                text_rec_score_thresh=0.3,
-            )
-            logger.info(f"PaddleOCR Reader 생성: {paddle_lang}")
+            # PP-OCRv5_server_rec이 잘 지원하는 언어 (중국어, 영어, 일본어)
+            # 이 언어들은 명시적으로 server_rec 모델 지정
+            well_supported_langs = {"ch", "chinese_cht", "en", "japan"}
+
+            if paddle_lang in well_supported_langs:
+                # 고성능 서버 모델 사용
+                ocr_readers[paddle_lang] = PaddleOCR(
+                    lang=paddle_lang,
+                    text_detection_model_name="PP-OCRv5_mobile_det",
+                    text_recognition_model_name="PP-OCRv5_server_rec",
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                    text_det_limit_side_len=736,
+                    text_det_limit_type='max',
+                    text_det_box_thresh=0.5,
+                    text_det_thresh=0.3,
+                    text_det_unclip_ratio=1.6,
+                    text_rec_score_thresh=0.3,
+                )
+                logger.info(f"PaddleOCR Reader 생성 (server_rec): {paddle_lang}")
+            else:
+                # 한국어 등 기타 언어: lang 파라미터만 사용하여 전용 모델 자동 선택
+                # 예: korean → korean_PP-OCRv5_mobile_rec 자동 다운로드
+                ocr_readers[paddle_lang] = PaddleOCR(
+                    lang=paddle_lang,
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                    text_det_limit_side_len=736,
+                    text_det_limit_type='max',
+                    text_det_box_thresh=0.5,
+                    text_det_thresh=0.3,
+                    text_det_unclip_ratio=1.6,
+                    text_rec_score_thresh=0.3,
+                )
+                logger.info(f"PaddleOCR Reader 생성 (auto model): {paddle_lang}")
+
         except Exception as e:
             logger.error(f"PaddleOCR Reader 생성 실패: {e}")
             # 실패시 영어 기본 리더 반환
@@ -178,23 +200,38 @@ def has_text_in_image(image_base64: str, min_chars: int = 5) -> bool:
         return True  # 오류 시 텍스트 있다고 가정 (안전하게)
 
 
-def validate_translation_language(image_base64: str, target_lang: str, threshold: float = 0.2) -> dict:
+def validate_translation_language(
+    image_base64: str,
+    target_lang: str,
+    source_lang: str = None,
+    threshold: float = 0.2
+) -> dict:
     """
-    OCR을 사용하여 번역된 이미지가 올바른 언어인지 검증
+    OCR을 사용하여 번역된 이미지가 올바른 언어인지 검증 (이중 검사)
+
+    검증 방식:
+    1. source_lang이 제공된 경우: 원본 언어 리더로 "남아있으면 안 되는 텍스트" 검사
+       → 원본 언어 텍스트가 threshold 이상 감지되면 번역 실패
+    2. source_lang이 없는 경우: 타겟 언어 리더로 "있어야 하는 텍스트" 검사
+       → 타겟 언어 비율이 (1-threshold) 미만이면 번역 실패
 
     Args:
         image_base64: 검증할 이미지의 base64 문자열
         target_lang: 번역 대상 언어 코드 (예: 'en', 'ja', 'zh')
-        threshold: 비타겟 언어 허용 비율 (기본 20%)
+        source_lang: 원본 언어 코드 (예: 'ko', 'zh') - 이중 검사용
+        threshold: 허용 비율 (기본 20%)
+            - source_lang 있음: 원본 언어 허용 비율 (20% 이하만 통과)
+            - source_lang 없음: 비타겟 언어 허용 비율
 
     Returns:
         dict: {
-            "valid": bool,          # 검증 통과 여부
-            "reason": str,          # 결과 사유
-            "has_text": bool,       # 텍스트 존재 여부
-            "total_chars": int,     # 총 감지된 문자 수
+            "valid": bool,
+            "reason": str,
+            "has_text": bool,
+            "total_chars": int,
+            "source_lang_ratio": float,  # 원본 언어 비율 (source_lang 사용시)
             "target_lang_ratio": float,  # 타겟 언어 비율
-            "detected_text": list   # 감지된 텍스트 목록 (디버깅용)
+            "detected_text": list
         }
     """
     try:
@@ -208,96 +245,19 @@ def validate_translation_language(image_base64: str, target_lang: str, threshold
         # RGB 변환 (필요한 경우)
         if len(image_np.shape) == 2:  # 그레이스케일
             pass  # PaddleOCR은 그레이스케일도 처리 가능
-        elif image_np.shape[2] == 4:  # RGBA
+        elif len(image_np.shape) == 3 and image_np.shape[2] == 4:  # RGBA
             image_np = cv2.cvtColor(image_np, cv2.COLOR_RGBA2RGB)
 
-        # 2. OCR 실행 (PaddleOCR 3.x - predict 메서드 사용)
-        reader = get_ocr_reader(target_lang)
-        results = reader.predict(image_np)
+        # ================================================================
+        # 이중 검사: source_lang이 제공된 경우 원본 언어 리더로 검사
+        # ================================================================
+        if source_lang:
+            return _validate_by_source_lang(image_np, source_lang, target_lang, threshold)
 
-        # 3. 텍스트 없으면 통과 (예외 케이스)
-        if results is None:
-            return {
-                "valid": True,
-                "reason": "텍스트 없음 - 검증 통과",
-                "has_text": False,
-                "total_chars": 0,
-                "target_lang_ratio": 1.0,
-                "detected_text": []
-            }
-
-        # 4. 감지된 텍스트 분석 (PaddleOCR 3.x 형식)
-        detected_texts = []
-        total_chars = 0
-
-        # PaddleOCR 3.x: results는 이터레이터, 각 res는 json 속성 보유
-        try:
-            for res in results:
-                # PaddleOCR 3.x: res.json['res'] 안에 실제 결과가 있음
-                inner_res = res.json.get('res', {}) if hasattr(res.json, 'get') else {}
-                rec_texts = inner_res.get('rec_texts', []) if hasattr(inner_res, 'get') else []
-                rec_scores = inner_res.get('rec_scores', []) if hasattr(inner_res, 'get') else []
-
-                for text, confidence in zip(rec_texts, rec_scores):
-                    if confidence is None or confidence <= 0.3:
-                        continue
-                    # 신뢰도 30% 이상만
-                    detected_texts.append({
-                        "text": str(text),
-                        "confidence": float(confidence),
-                        "char_count": len(str(text).replace(" ", ""))
-                    })
-                    total_chars += len(str(text).replace(" ", ""))
-        except Exception as parse_error:
-            logger.error(f"OCR 결과 파싱 오류: {parse_error}, results type: {type(results)}")
-            return {
-                "valid": True,
-                "reason": f"OCR 파싱 오류로 통과 처리: {str(parse_error)}",
-                "has_text": False,
-                "total_chars": 0,
-                "target_lang_ratio": 1.0,
-                "detected_text": []
-            }
-
-        # 텍스트가 너무 적으면 통과
-        if total_chars < 5:
-            return {
-                "valid": True,
-                "reason": "텍스트 적음 - 검증 통과",
-                "has_text": True,
-                "total_chars": total_chars,
-                "target_lang_ratio": 1.0,
-                "detected_text": detected_texts
-            }
-
-        # 5. 언어 판별 (간단한 휴리스틱)
-        target_lang_chars = count_target_language_chars(
-            "".join([t["text"] for t in detected_texts]),
-            target_lang
-        )
-
-        target_ratio = target_lang_chars / total_chars if total_chars > 0 else 1.0
-        non_target_ratio = 1.0 - target_ratio
-
-        # 6. 검증 결과
-        if non_target_ratio > threshold:
-            return {
-                "valid": False,
-                "reason": f"번역 미완료: 타겟 언어({target_lang}) 비율 {target_ratio:.1%}, 비타겟 언어 비율 {non_target_ratio:.1%}",
-                "has_text": True,
-                "total_chars": total_chars,
-                "target_lang_ratio": target_ratio,
-                "detected_text": detected_texts
-            }
-
-        return {
-            "valid": True,
-            "reason": f"번역 검증 통과: 타겟 언어({target_lang}) 비율 {target_ratio:.1%}",
-            "has_text": True,
-            "total_chars": total_chars,
-            "target_lang_ratio": target_ratio,
-            "detected_text": detected_texts
-        }
+        # ================================================================
+        # 기존 방식: 타겟 언어 리더로 검사
+        # ================================================================
+        return _validate_by_target_lang(image_np, target_lang, threshold)
 
     except Exception as e:
         logger.error(f"번역 언어 검증 오류: {e}")
@@ -307,9 +267,192 @@ def validate_translation_language(image_base64: str, target_lang: str, threshold
             "reason": f"검증 오류로 통과 처리: {str(e)}",
             "has_text": False,
             "total_chars": 0,
+            "source_lang_ratio": 0.0,
             "target_lang_ratio": 1.0,
             "detected_text": []
         }
+
+
+def _validate_by_source_lang(image_np, source_lang: str, target_lang: str, threshold: float) -> dict:
+    """
+    원본 언어 리더로 "남아있으면 안 되는 텍스트" 검사
+
+    원본 언어 텍스트가 많이 감지되면 = 번역 실패
+    """
+    # 원본 언어 OCR 실행
+    reader = get_ocr_reader(source_lang)
+    results = reader.predict(image_np)
+
+    if results is None:
+        return {
+            "valid": True,
+            "reason": "텍스트 없음 - 검증 통과",
+            "has_text": False,
+            "total_chars": 0,
+            "source_lang_ratio": 0.0,
+            "target_lang_ratio": 1.0,
+            "detected_text": []
+        }
+
+    # OCR 결과 파싱
+    detected_texts = []
+    total_chars = 0
+
+    try:
+        for res in results:
+            inner_res = res.json.get('res', {}) if hasattr(res.json, 'get') else {}
+            rec_texts = inner_res.get('rec_texts', []) if hasattr(inner_res, 'get') else []
+            rec_scores = inner_res.get('rec_scores', []) if hasattr(inner_res, 'get') else []
+
+            for text, confidence in zip(rec_texts, rec_scores):
+                if confidence is None or confidence <= 0.3:
+                    continue
+                detected_texts.append({
+                    "text": str(text),
+                    "confidence": float(confidence),
+                    "char_count": len(str(text).replace(" ", ""))
+                })
+                total_chars += len(str(text).replace(" ", ""))
+    except Exception as parse_error:
+        logger.error(f"OCR 결과 파싱 오류: {parse_error}")
+        return {
+            "valid": True,
+            "reason": f"OCR 파싱 오류로 통과 처리: {str(parse_error)}",
+            "has_text": False,
+            "total_chars": 0,
+            "source_lang_ratio": 0.0,
+            "target_lang_ratio": 1.0,
+            "detected_text": []
+        }
+
+    # 텍스트가 너무 적으면 통과 (번역 성공으로 간주)
+    if total_chars < 5:
+        return {
+            "valid": True,
+            "reason": f"원본 언어({source_lang}) 텍스트 거의 없음 - 번역 성공",
+            "has_text": total_chars > 0,
+            "total_chars": total_chars,
+            "source_lang_ratio": 0.0,
+            "target_lang_ratio": 1.0,
+            "detected_text": detected_texts
+        }
+
+    # 원본 언어 문자 카운트
+    all_text = "".join([t["text"] for t in detected_texts])
+    source_lang_chars = count_target_language_chars(all_text, source_lang)
+    source_ratio = source_lang_chars / total_chars if total_chars > 0 else 0.0
+
+    # 검증: 원본 언어 비율이 threshold 초과하면 번역 실패
+    if source_ratio > threshold:
+        return {
+            "valid": False,
+            "reason": f"번역 미완료: 원본 언어({source_lang}) {source_ratio:.1%} 남음 (허용 {threshold:.0%})",
+            "has_text": True,
+            "total_chars": total_chars,
+            "source_lang_ratio": source_ratio,
+            "target_lang_ratio": 1.0 - source_ratio,
+            "detected_text": detected_texts
+        }
+
+    return {
+        "valid": True,
+        "reason": f"번역 검증 통과: 원본 언어({source_lang}) {source_ratio:.1%}만 남음",
+        "has_text": True,
+        "total_chars": total_chars,
+        "source_lang_ratio": source_ratio,
+        "target_lang_ratio": 1.0 - source_ratio,
+        "detected_text": detected_texts
+    }
+
+
+def _validate_by_target_lang(image_np, target_lang: str, threshold: float) -> dict:
+    """
+    타겟 언어 리더로 "있어야 하는 텍스트" 검사 (기존 방식)
+    """
+    reader = get_ocr_reader(target_lang)
+    results = reader.predict(image_np)
+
+    if results is None:
+        return {
+            "valid": True,
+            "reason": "텍스트 없음 - 검증 통과",
+            "has_text": False,
+            "total_chars": 0,
+            "source_lang_ratio": 0.0,
+            "target_lang_ratio": 1.0,
+            "detected_text": []
+        }
+
+    # OCR 결과 파싱
+    detected_texts = []
+    total_chars = 0
+
+    try:
+        for res in results:
+            inner_res = res.json.get('res', {}) if hasattr(res.json, 'get') else {}
+            rec_texts = inner_res.get('rec_texts', []) if hasattr(inner_res, 'get') else []
+            rec_scores = inner_res.get('rec_scores', []) if hasattr(inner_res, 'get') else []
+
+            for text, confidence in zip(rec_texts, rec_scores):
+                if confidence is None or confidence <= 0.3:
+                    continue
+                detected_texts.append({
+                    "text": str(text),
+                    "confidence": float(confidence),
+                    "char_count": len(str(text).replace(" ", ""))
+                })
+                total_chars += len(str(text).replace(" ", ""))
+    except Exception as parse_error:
+        logger.error(f"OCR 결과 파싱 오류: {parse_error}")
+        return {
+            "valid": True,
+            "reason": f"OCR 파싱 오류로 통과 처리: {str(parse_error)}",
+            "has_text": False,
+            "total_chars": 0,
+            "source_lang_ratio": 0.0,
+            "target_lang_ratio": 1.0,
+            "detected_text": []
+        }
+
+    # 텍스트가 너무 적으면 통과
+    if total_chars < 5:
+        return {
+            "valid": True,
+            "reason": "텍스트 적음 - 검증 통과",
+            "has_text": total_chars > 0,
+            "total_chars": total_chars,
+            "source_lang_ratio": 0.0,
+            "target_lang_ratio": 1.0,
+            "detected_text": detected_texts
+        }
+
+    # 타겟 언어 문자 카운트
+    all_text = "".join([t["text"] for t in detected_texts])
+    target_lang_chars = count_target_language_chars(all_text, target_lang)
+    target_ratio = target_lang_chars / total_chars if total_chars > 0 else 1.0
+    non_target_ratio = 1.0 - target_ratio
+
+    # 검증: 비타겟 언어 비율이 threshold 초과하면 번역 실패
+    if non_target_ratio > threshold:
+        return {
+            "valid": False,
+            "reason": f"번역 미완료: 타겟 언어({target_lang}) 비율 {target_ratio:.1%}",
+            "has_text": True,
+            "total_chars": total_chars,
+            "source_lang_ratio": non_target_ratio,
+            "target_lang_ratio": target_ratio,
+            "detected_text": detected_texts
+        }
+
+    return {
+        "valid": True,
+        "reason": f"번역 검증 통과: 타겟 언어({target_lang}) 비율 {target_ratio:.1%}",
+        "has_text": True,
+        "total_chars": total_chars,
+        "source_lang_ratio": 1.0 - target_ratio,
+        "target_lang_ratio": target_ratio,
+        "detected_text": detected_texts
+    }
 
 
 def count_target_language_chars(text: str, target_lang: str) -> int:
@@ -1150,13 +1293,16 @@ def validate_chunk(chunk_base64, expected_width=None, expected_height=None, tole
         }
     """
     try:
-        # 1. Base64 디코딩 가능 여부
-        if not chunk_base64 or len(chunk_base64) < 1000:
-            return {"valid": False, "reason": "이미지 데이터 없음 또는 너무 작음", "actual_width": 0, "actual_height": 0}
+        # 1. Base64 데이터 존재 여부
+        if not chunk_base64:
+            return {"valid": False, "reason": "이미지 데이터 없음", "actual_width": 0, "actual_height": 0}
 
-        # 2. 이미지 디코딩
+        # 2. 이미지 디코딩 (실제 디코딩 성공 여부로 유효성 판단)
         try:
             image_bytes = base64.b64decode(chunk_base64)
+            image = Image.open(BytesIO(image_bytes))
+            image.verify()  # 이미지 무결성 검증
+            # verify() 후 다시 열어야 함
             image = Image.open(BytesIO(image_bytes))
             actual_width, actual_height = image.size
         except Exception as e:
@@ -1202,6 +1348,7 @@ def validate_chunk(chunk_base64, expected_width=None, expected_height=None, tole
 def validate_translated_chunk(
     chunk_base64: str,
     target_lang: str = None,
+    source_lang: str = None,
     expected_width: int = None,
     expected_height: int = None,
     size_tolerance: float = 0.3,
@@ -1214,10 +1361,11 @@ def validate_translated_chunk(
     Args:
         chunk_base64: 검증할 번역된 이미지 base64
         target_lang: 번역 대상 언어 코드 (예: 'en', 'ja')
+        source_lang: 원본 언어 코드 (예: 'ko', 'zh') - 이중 검사용
         expected_width: 예상 너비
         expected_height: 예상 높이
         size_tolerance: 크기 허용 오차 (기본 30%)
-        lang_threshold: 비타겟 언어 허용 비율 (기본 20%)
+        lang_threshold: 원본 언어 허용 비율 (기본 20%)
         skip_ocr: OCR 검증 건너뛰기
 
     Returns:
@@ -1265,6 +1413,7 @@ def validate_translated_chunk(
             lang_result = validate_translation_language(
                 chunk_base64,
                 target_lang,
+                source_lang=source_lang,
                 threshold=lang_threshold
             )
             result["translation_validation"] = lang_result
@@ -4450,6 +4599,7 @@ def validate_image_chunks():
         image_key: 이미지 식별자 ("productId_imageIndex")
         chunks: 청크 리스트 [{index, base64, width, height, key}, ...]
         target_lang: 번역 대상 언어 (예: "en")
+        source_lang: 원본 언어 (예: "ko") - 이중 검사용, 권장
         skip_ocr: OCR 검증 건너뛰기 (기본 false)
 
     Response:
@@ -4464,6 +4614,7 @@ def validate_image_chunks():
         image_key = data.get("image_key")
         chunks = data.get("chunks", [])
         target_lang = data.get("target_lang", "en")
+        source_lang = data.get("source_lang")  # 원본 언어 (이중 검사용)
         skip_ocr = data.get("skip_ocr", False)
 
         if not image_key or not chunks:
@@ -4506,6 +4657,7 @@ def validate_image_chunks():
             validation = validate_translated_chunk(
                 chunk_base64,
                 target_lang=target_lang if not skip_ocr else None,
+                source_lang=source_lang if not skip_ocr else None,
                 expected_width=expected_width,
                 expected_height=expected_height,
                 size_tolerance=0.3,
