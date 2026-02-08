@@ -25,8 +25,9 @@ COPY server.py batch_processor.py ./
 
 # 환경 변수
 ENV PORT=5001
-ENV WORKERS=2
+ENV WORKERS=1
 ENV PYTHONUNBUFFERED=1
+ENV MALLOC_TRIM_THRESHOLD_=65536
 # PaddlePaddle 호환성 설정
 ENV FLAGS_enable_pir_api=0
 ENV FLAGS_enable_pir_in_executor=0

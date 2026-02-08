@@ -61,96 +61,100 @@ LANGUAGE_CODE_MAP = {
     "hi": "hi",          # 힌디어
 }
 
-# OCR Reader 캐시 (언어별로 생성하여 재사용)
-ocr_readers = {}
+# OCR Reader 단일 캐시 (메모리 절약: 항상 1개 언어 모델만 유지)
+_current_ocr_reader = None
+_current_ocr_lang = None
 
 def get_ocr_reader(target_lang: str):
     """
-    대상 언어에 맞는 PaddleOCR Reader를 반환 (캐싱)
+    대상 언어에 맞는 PaddleOCR Reader를 반환 (단일 캐시)
 
-    Args:
-        target_lang: 대상 언어 코드 (예: 'en', 'ja', 'zh', 'ko')
-
-    Returns:
-        PaddleOCR 객체
-
-    Note:
-        - 중국어(ch)/영어(en)/일본어(japan): PP-OCRv5_server_rec 사용 (고성능)
-        - 한국어(korean) 등 기타 언어: lang 파라미터만 사용 (언어별 전용 모델 자동 선택)
+    메모리 절약을 위해 한 번에 1개 언어 모델만 유지.
+    다른 언어 요청 시 기존 모델 해제 후 새 모델 로딩.
     """
+    global _current_ocr_reader, _current_ocr_lang
+    import gc
+
     paddle_lang = LANGUAGE_CODE_MAP.get(target_lang, "en")
 
-    if paddle_lang not in ocr_readers:
-        try:
-            import logging
-            logging.getLogger('ppocr').setLevel(logging.WARNING)
+    if _current_ocr_lang == paddle_lang and _current_ocr_reader is not None:
+        return _current_ocr_reader
 
-            # PP-OCRv5_server_rec이 잘 지원하는 언어 (중국어, 영어, 일본어)
-            # 이 언어들은 명시적으로 server_rec 모델 지정
-            well_supported_langs = {"ch", "chinese_cht", "en", "japan"}
+    # 기존 모델 해제
+    if _current_ocr_reader is not None:
+        logger.info(f"PaddleOCR Reader 교체: {_current_ocr_lang} → {paddle_lang}")
+        del _current_ocr_reader
+        _current_ocr_reader = None
+        _current_ocr_lang = None
+        gc.collect()
 
-            if paddle_lang in well_supported_langs:
-                # 고성능 서버 모델 사용
-                ocr_readers[paddle_lang] = PaddleOCR(
-                    lang=paddle_lang,
-                    text_detection_model_name="PP-OCRv5_mobile_det",
-                    text_recognition_model_name="PP-OCRv5_server_rec",
-                    use_doc_orientation_classify=False,
-                    use_doc_unwarping=False,
-                    use_textline_orientation=False,
-                    text_det_limit_side_len=736,
-                    text_det_limit_type='max',
-                    text_det_box_thresh=0.5,
-                    text_det_thresh=0.3,
-                    text_det_unclip_ratio=1.6,
-                    text_rec_score_thresh=0.3,
-                )
-                logger.info(f"PaddleOCR Reader 생성 (server_rec): {paddle_lang}")
-            else:
-                # 한국어 등 기타 언어: lang 파라미터만 사용하여 전용 모델 자동 선택
-                # 예: korean → korean_PP-OCRv5_mobile_rec 자동 다운로드
-                ocr_readers[paddle_lang] = PaddleOCR(
-                    lang=paddle_lang,
-                    use_doc_orientation_classify=False,
-                    use_doc_unwarping=False,
-                    use_textline_orientation=False,
-                    text_det_limit_side_len=736,
-                    text_det_limit_type='max',
-                    text_det_box_thresh=0.5,
-                    text_det_thresh=0.3,
-                    text_det_unclip_ratio=1.6,
-                    text_rec_score_thresh=0.3,
-                )
-                logger.info(f"PaddleOCR Reader 생성 (auto model): {paddle_lang}")
+    try:
+        import logging as _logging
+        _logging.getLogger('ppocr').setLevel(_logging.WARNING)
 
-        except Exception as e:
-            logger.error(f"PaddleOCR Reader 생성 실패: {e}")
-            # 실패시 영어 기본 리더 반환
-            if "en" not in ocr_readers:
-                ocr_readers["en"] = PaddleOCR(
-                    lang="en",
-                    text_detection_model_name="PP-OCRv5_mobile_det",
-                    text_recognition_model_name="PP-OCRv5_server_rec",
-                    use_doc_orientation_classify=False,
-                    use_doc_unwarping=False,
-                    use_textline_orientation=False,
-                    text_det_limit_side_len=736,
-                    text_det_limit_type='max',
-                    text_det_box_thresh=0.5,
-                    text_det_thresh=0.3,
-                    text_det_unclip_ratio=1.6,
-                    text_rec_score_thresh=0.3,
-                )
-            return ocr_readers["en"]
+        well_supported_langs = {"ch", "chinese_cht", "en", "japan"}
 
-    return ocr_readers[paddle_lang]
+        if paddle_lang in well_supported_langs:
+            _current_ocr_reader = PaddleOCR(
+                lang=paddle_lang,
+                text_detection_model_name="PP-OCRv5_mobile_det",
+                text_recognition_model_name="PP-OCRv5_server_rec",
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+                text_det_limit_side_len=736,
+                text_det_limit_type='max',
+                text_det_box_thresh=0.5,
+                text_det_thresh=0.3,
+                text_det_unclip_ratio=1.6,
+                text_rec_score_thresh=0.3,
+            )
+            logger.info(f"PaddleOCR Reader 생성 (server_rec): {paddle_lang}")
+        else:
+            _current_ocr_reader = PaddleOCR(
+                lang=paddle_lang,
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+                text_det_limit_side_len=736,
+                text_det_limit_type='max',
+                text_det_box_thresh=0.5,
+                text_det_thresh=0.3,
+                text_det_unclip_ratio=1.6,
+                text_rec_score_thresh=0.3,
+            )
+            logger.info(f"PaddleOCR Reader 생성 (auto model): {paddle_lang}")
+
+        _current_ocr_lang = paddle_lang
+
+    except Exception as e:
+        logger.error(f"PaddleOCR Reader 생성 실패: {e}")
+        if _current_ocr_reader is None:
+            _current_ocr_reader = PaddleOCR(
+                lang="en",
+                text_detection_model_name="PP-OCRv5_mobile_det",
+                text_recognition_model_name="PP-OCRv5_server_rec",
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+                text_det_limit_side_len=736,
+                text_det_limit_type='max',
+                text_det_box_thresh=0.5,
+                text_det_thresh=0.3,
+                text_det_unclip_ratio=1.6,
+                text_rec_score_thresh=0.3,
+            )
+            _current_ocr_lang = "en"
+
+    return _current_ocr_reader
 
 
 def validate_translation_language(
     image_base64: str,
     target_lang: str,
     source_lang: str = None,
-    threshold: float = 0.2
+    threshold: float = 0.2,
+    image_np=None
 ) -> dict:
     """
     OCR을 사용하여 번역된 이미지가 올바른 언어인지 검증 (이중 검사)
@@ -168,6 +172,7 @@ def validate_translation_language(
         threshold: 허용 비율 (기본 20%)
             - source_lang 있음: 원본 언어 허용 비율 (20% 이하만 통과)
             - source_lang 없음: 비타겟 언어 허용 비율
+        image_np: 이미 디코딩된 numpy array (있으면 base64 디코딩 스킵)
 
     Returns:
         dict: {
@@ -181,18 +186,18 @@ def validate_translation_language(
         }
     """
     try:
-        # 1. 이미지 디코딩
-        image_bytes = base64.b64decode(image_base64)
-        image = Image.open(BytesIO(image_bytes))
+        # 1. 이미지 디코딩 (image_np가 없을 때만)
+        if image_np is None:
+            image_bytes = base64.b64decode(image_base64)
+            image = Image.open(BytesIO(image_bytes))
+            image_np = np.array(image)
+            del image_bytes
 
-        # PIL Image를 numpy array로 변환
-        image_np = np.array(image)
-
-        # RGB 변환 (필요한 경우)
-        if len(image_np.shape) == 2:  # 그레이스케일
-            pass  # PaddleOCR은 그레이스케일도 처리 가능
-        elif len(image_np.shape) == 3 and image_np.shape[2] == 4:  # RGBA
-            image_np = cv2.cvtColor(image_np, cv2.COLOR_RGBA2RGB)
+            # RGB 변환 (필요한 경우)
+            if len(image_np.shape) == 2:  # 그레이스케일
+                pass  # PaddleOCR은 그레이스케일도 처리 가능
+            elif len(image_np.shape) == 3 and image_np.shape[2] == 4:  # RGBA
+                image_np = cv2.cvtColor(image_np, cv2.COLOR_RGBA2RGB)
 
         # ================================================================
         # 이중 검사: source_lang이 제공된 경우 원본 언어 리더로 검사
@@ -674,6 +679,11 @@ def validate_chunk(chunk_base64, expected_width=None, expected_height=None, tole
             # verify() 후 다시 열어야 함
             image = Image.open(BytesIO(image_bytes))
             actual_width, actual_height = image.size
+            # OCR 재사용을 위해 numpy array 생성
+            image_np = np.array(image)
+            del image_bytes
+            if len(image_np.shape) == 3 and image_np.shape[2] == 4:  # RGBA
+                image_np = cv2.cvtColor(image_np, cv2.COLOR_RGBA2RGB)
         except Exception as e:
             return {"valid": False, "reason": f"이미지 디코딩 실패: {str(e)}", "actual_width": 0, "actual_height": 0}
 
@@ -708,7 +718,7 @@ def validate_chunk(chunk_base64, expected_width=None, expected_height=None, tole
                 "actual_height": actual_height
             }
 
-        return {"valid": True, "reason": "검증 통과", "actual_width": actual_width, "actual_height": actual_height}
+        return {"valid": True, "reason": "검증 통과", "actual_width": actual_width, "actual_height": actual_height, "image_np": image_np}
 
     except Exception as e:
         return {"valid": False, "reason": f"검증 중 오류: {str(e)}", "actual_width": 0, "actual_height": 0}
@@ -763,6 +773,8 @@ def validate_translated_chunk(
         expected_height=expected_height,
         tolerance=size_tolerance
     )
+    # image_np 추출 후 size_validation에서 제거 (JSON 직렬화 불가)
+    chunk_image_np = size_result.pop("image_np", None)
     result["size_validation"] = size_result
 
     if not size_result["valid"]:
@@ -783,7 +795,8 @@ def validate_translated_chunk(
                 chunk_base64,
                 target_lang,
                 source_lang=source_lang,
-                threshold=lang_threshold
+                threshold=lang_threshold,
+                image_np=chunk_image_np
             )
             result["translation_validation"] = lang_result
 
@@ -2721,10 +2734,11 @@ def validate_image_chunks():
 
         logger.info(f"[ValidateImageChunks] Validating {len(chunks)} chunks for {image_key}")
 
+        import gc
         valid_chunks = []
         defective_chunks = []
 
-        for chunk in chunks:
+        for i, chunk in enumerate(chunks):
             chunk_index = chunk.get("index")
             chunk_base64 = chunk.get("base64")
             chunk_key = chunk.get("key")
@@ -2782,6 +2796,13 @@ def validate_image_chunks():
                     "original_height": expected_height
                 })
 
+            # 메모리 정리: 입력 base64 참조 해제, 2청크마다 GC
+            chunk["base64"] = None
+            del validation
+            if (i + 1) % 2 == 0:
+                gc.collect()
+
+        gc.collect()
         all_valid = len(defective_chunks) == 0
 
         logger.info(f"[ValidateImageChunks] {image_key}: {len(valid_chunks)} valid, {len(defective_chunks)} defective")
@@ -3461,8 +3482,9 @@ def process_retry_result():
         image_processing_id = ip_result[0]["id"]
 
         # 2. 재처리된 청크 검증 및 DB 업데이트
+        import gc
         still_invalid = 0
-        for chunk in retry_chunks:
+        for i, chunk in enumerate(retry_chunks):
             chunk_index = chunk.get("index")
             chunk_base64 = chunk.get("base64")
 
@@ -3502,6 +3524,14 @@ def process_retry_result():
                         "last_error": validation.get("reason")
                     }
                 )
+
+            # 메모리 정리
+            chunk["base64"] = None
+            del validation
+            if (i + 1) % 2 == 0:
+                gc.collect()
+
+        gc.collect()
 
         # 3. 모든 청크가 valid인지 확인
         success, all_chunks = supabase_request(
