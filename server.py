@@ -98,7 +98,7 @@ def get_ocr_reader(target_lang: str):
             _current_ocr_reader = PaddleOCR(
                 lang=paddle_lang,
                 text_detection_model_name="PP-OCRv5_mobile_det",
-                text_recognition_model_name="PP-OCRv5_server_rec",
+                text_recognition_model_name="PP-OCRv5_mobile_rec",
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
                 use_textline_orientation=False,
@@ -109,7 +109,7 @@ def get_ocr_reader(target_lang: str):
                 text_det_unclip_ratio=1.6,
                 text_rec_score_thresh=0.3,
             )
-            logger.info(f"PaddleOCR Reader 생성 (server_rec): {paddle_lang}")
+            logger.info(f"PaddleOCR Reader 생성 (mobile_rec): {paddle_lang}")
         else:
             _current_ocr_reader = PaddleOCR(
                 lang=paddle_lang,
@@ -133,7 +133,7 @@ def get_ocr_reader(target_lang: str):
             _current_ocr_reader = PaddleOCR(
                 lang="en",
                 text_detection_model_name="PP-OCRv5_mobile_det",
-                text_recognition_model_name="PP-OCRv5_server_rec",
+                text_recognition_model_name="PP-OCRv5_mobile_rec",
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
                 use_textline_orientation=False,
