@@ -2179,6 +2179,7 @@ def prepare_batch():
 # ===== v10: 새로운 배치 처리 시스템 =====
 from batch_processor import (
     get_invalid_chunks_for_retry,
+    get_batch_progress,
     check_and_complete_images,
     update_chunk_status,
     update_image_status,
