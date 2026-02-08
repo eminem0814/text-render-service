@@ -2297,14 +2297,14 @@ def create_retry_batch_endpoint():
         for chunk in chunks_to_retry:
             original_b64 = chunk.get("original_base64", "")
 
+            # 청크 메타 추출 (키 생성 + Storage 조회용)
+            img_info = chunk.get("image_processing", {})
+            product_id = img_info.get("product_id")
+            image_index = img_info.get("image_index")
+            chunk_index = chunk.get("chunk_index")
+
             # original_base64가 없으면 Storage에서 가져오기
             if not original_b64 and storage_batch_id:
-                # 청크 키 구성: p{productId}_i{imageIndex}_c{chunkIndex}
-                img_info = chunk.get("image_processing", {})
-                product_id = img_info.get("product_id")
-                image_index = img_info.get("image_index")
-                chunk_index = chunk.get("chunk_index")
-
                 if product_id is not None and image_index is not None and chunk_index is not None:
                     chunk_key = f"p{product_id}_i{image_index}_c{chunk_index}"
                     logger.info(f"[RetryBatch] Fetching from storage: {chunk_key}")
@@ -2326,7 +2326,11 @@ def create_retry_batch_endpoint():
                 skipped_no_data += 1
                 continue
 
-            custom_id = f"retry_{batch_job_id}_{chunk['id']}_{int(time.time())}"
+            # 원본 키 형식 사용 (/get-batch-images의 chunk_metadata 매칭 호환)
+            if product_id is not None and image_index is not None and chunk_index is not None:
+                custom_id = f"p{product_id}_i{image_index}_c{chunk_index}"
+            else:
+                custom_id = f"retry_{batch_job_id}_{chunk['id']}_{int(time.time())}"
 
             batch_requests.append({
                 "key": custom_id,
