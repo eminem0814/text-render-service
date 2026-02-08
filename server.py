@@ -2160,6 +2160,7 @@ def prepare_batch():
                 "storageBucket": config.get("storageBucket"),
                 "textServiceUrl": text_service_url,
                 "targetLangCode": config.get("targetLangCode", "en"),
+                "sourceLangCode": config.get("sourceLangCode", "ko"),
                 "outputFormat": config.get("outputFormat", "WEBP"),
                 "outputExtension": config.get("outputExtension", ".webp"),
                 "outputQuality": config.get("outputQuality", 100),
