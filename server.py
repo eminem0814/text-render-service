@@ -2461,6 +2461,21 @@ def complete_batch(batch_id):
         supabase_key = config.get("supabaseKey") or SUPABASE_SERVICE_KEY
         table_name = config.get("tableName", "")
 
+        # tableName이 config에 없으면 batch_jobs.batch_name에서 추출 (형식: batch-{table_name}-{timestamp})
+        if not table_name:
+            success, batch_records = supabase_request(
+                "GET",
+                f"batch_jobs?id=eq.{batch_id}&select=batch_name",
+                supabase_url, supabase_key
+            )
+            if success and batch_records:
+                batch_name = batch_records[0].get("batch_name", "")
+                # "batch-tableName-1234567890" → "tableName"
+                parts = batch_name.split("-")
+                if len(parts) >= 3:
+                    table_name = "-".join(parts[1:-1])
+                    logger.info(f"[CompleteBatch] tableName from batch_name: {table_name}")
+
         if not table_name:
             return jsonify({"error": "tableName required in config"}), 400
 
