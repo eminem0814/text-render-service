@@ -276,8 +276,12 @@ def _validate_by_source_lang(image_np, source_lang: str, target_lang: str, thres
             "detected_text": []
         }
 
+    # 문자 분류: 숫자/기호/구두점은 언어 중립이므로 비율 계산에서 제외
+    all_text = "".join([t["text"] for t in detected_texts])
+    letter_chars = sum(1 for c in all_text if c.isalpha())
+
     # 텍스트가 너무 적으면 통과 (번역 성공으로 간주)
-    if total_chars < 5:
+    if letter_chars < 5:
         return {
             "valid": True,
             "reason": f"원본 언어({source_lang}) 텍스트 거의 없음 - 번역 성공",
@@ -288,10 +292,9 @@ def _validate_by_source_lang(image_np, source_lang: str, target_lang: str, thres
             "detected_text": detected_texts
         }
 
-    # 원본 언어 문자 카운트
-    all_text = "".join([t["text"] for t in detected_texts])
+    # 원본 언어 문자 카운트 (letter_chars 기준 비율)
     source_lang_chars = count_target_language_chars(all_text, source_lang)
-    source_ratio = source_lang_chars / total_chars if total_chars > 0 else 0.0
+    source_ratio = source_lang_chars / letter_chars if letter_chars > 0 else 0.0
 
     # 검증: 원본 언어 비율이 threshold 초과하면 번역 실패
     if source_ratio > threshold:
@@ -365,8 +368,12 @@ def _validate_by_target_lang(image_np, target_lang: str, threshold: float) -> di
             "detected_text": []
         }
 
+    # 문자 분류: 숫자/기호/구두점은 언어 중립이므로 비율 계산에서 제외
+    all_text = "".join([t["text"] for t in detected_texts])
+    letter_chars = sum(1 for c in all_text if c.isalpha())
+
     # 텍스트가 너무 적으면 통과
-    if total_chars < 5:
+    if letter_chars < 5:
         return {
             "valid": True,
             "reason": "텍스트 적음 - 검증 통과",
@@ -377,10 +384,9 @@ def _validate_by_target_lang(image_np, target_lang: str, threshold: float) -> di
             "detected_text": detected_texts
         }
 
-    # 타겟 언어 문자 카운트
-    all_text = "".join([t["text"] for t in detected_texts])
+    # 타겟 언어 문자 카운트 (letter_chars 기준 비율)
     target_lang_chars = count_target_language_chars(all_text, target_lang)
-    target_ratio = target_lang_chars / total_chars if total_chars > 0 else 1.0
+    target_ratio = target_lang_chars / letter_chars if letter_chars > 0 else 1.0
     non_target_ratio = 1.0 - target_ratio
 
     # 검증: 비타겟 언어 비율이 threshold 초과하면 번역 실패
