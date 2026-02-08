@@ -814,6 +814,11 @@ def validate_translated_chunk(
                 "reason": f"검증 오류로 통과 처리: {str(e)}",
                 "has_text": False
             }
+        finally:
+            # OCR 완료 후 numpy array 즉시 해제
+            del chunk_image_np
+    else:
+        del chunk_image_np
 
     result["reason"] = "모든 검증 통과"
     return result
@@ -2796,13 +2801,13 @@ def validate_image_chunks():
                     "original_height": expected_height
                 })
 
-            # 메모리 정리: 입력 base64 참조 해제, 2청크마다 GC
+            # 메모리 정리: 1청크 처리 → 분류 → 즉시 캐시 삭제
             chunk["base64"] = None
+            chunk_base64 = None
             del validation
-            if (i + 1) % 2 == 0:
-                gc.collect()
+            gc.collect()
+            logger.info(f"[ValidateImageChunks] chunk {chunk_index} done, gc.collect() completed")
 
-        gc.collect()
         all_valid = len(defective_chunks) == 0
 
         logger.info(f"[ValidateImageChunks] {image_key}: {len(valid_chunks)} valid, {len(defective_chunks)} defective")
@@ -3525,13 +3530,11 @@ def process_retry_result():
                     }
                 )
 
-            # 메모리 정리
+            # 메모리 정리: 1청크 처리 → 분류 → 즉시 캐시 삭제
             chunk["base64"] = None
+            chunk_base64 = None
             del validation
-            if (i + 1) % 2 == 0:
-                gc.collect()
-
-        gc.collect()
+            gc.collect()
 
         # 3. 모든 청크가 valid인지 확인
         success, all_chunks = supabase_request(
