@@ -331,15 +331,25 @@ def check_and_complete_images(
     completed_count = 0
     results = []
 
+    # batch_id 조회 (Storage에서 원본 청크 fetch용)
+    batch_id = None
+    success_bj, batch_jobs = supabase_request(
+        "GET",
+        f"batch_jobs?id=eq.{batch_job_id}&select=chunk_metadata",
+        supabase_url, supabase_key
+    )
+    if success_bj and batch_jobs and batch_jobs[0].get("chunk_metadata"):
+        first_meta = batch_jobs[0]["chunk_metadata"][0] if batch_jobs[0]["chunk_metadata"] else {}
+        batch_id = first_meta.get("batchId")
+
     for image in images:
         image_id = image["id"]
         product_id = image["product_id"]
         image_index = image["image_index"]
-        total_chunks = image["total_chunks"]
 
         # 청크 조회
         success, chunks = get_chunks_by_image(image_id, supabase_url, supabase_key)
-        if not success:
+        if not success or not chunks:
             continue
 
         # 모든 청크가 valid 또는 replaced인지 확인
@@ -355,16 +365,24 @@ def check_and_complete_images(
                     "base64": chunk["translated_base64"]
                 })
             elif status == "replaced":
+                # original_base64가 없으면 Storage에서 fetch
+                original_b64 = chunk.get("original_base64") or ""
+                if not original_b64 and batch_id:
+                    chunk_key = f"p{product_id}_i{image_index}_c{chunk['chunk_index']}"
+                    original_b64 = fetch_original_chunk_from_storage(
+                        chunk_key, batch_id, supabase_url, supabase_key
+                    )
                 ready_chunks.append({
                     "index": chunk["chunk_index"],
-                    "base64": chunk["original_base64"]  # 원본 사용
+                    "base64": original_b64
                 })
                 replaced_count += 1
             else:
                 not_ready = True
                 break
 
-        if not_ready or len(ready_chunks) != total_chunks:
+        # 실제 DB 청크 수 기준으로 비교 (image_processing.total_chunks와 다를 수 있음)
+        if not_ready or len(ready_chunks) == 0:
             continue
 
         # 병합 및 업로드
