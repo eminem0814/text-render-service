@@ -2529,6 +2529,17 @@ def complete_batch(batch_id):
         if not table_name:
             return jsonify({"error": "tableName required in config"}), 400
 
+        # partial 이미지 병합 시도 (청크가 모두 valid/replaced면 completed로 전환)
+        try:
+            merge_result = check_and_complete_images(
+                batch_id, config,
+                base64_to_image, image_to_base64, merge_images
+            )
+            if merge_result.get("completed", 0) > 0:
+                logger.info(f"[CompleteBatch] Merged {merge_result['completed']} images")
+        except Exception as e:
+            logger.warning(f"[CompleteBatch] check_and_complete_images error: {e}")
+
         # 진행 상황 확인
         progress = get_batch_progress(batch_id, supabase_url, supabase_key)
 
