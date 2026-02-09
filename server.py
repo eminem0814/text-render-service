@@ -654,6 +654,47 @@ except Exception as e:
     logger.warning(f"Vertex AI not available: {e}")
 
 
+def resize_chunk_to_original(chunk_base64, expected_width, expected_height):
+    """
+    Gemini 출력 이미지를 원본 크기로 리사이즈
+
+    Gemini API는 입력과 다른 해상도로 이미지를 반환할 수 있음.
+    검증/병합 전에 원본 크기로 맞춰야 정확한 처리 가능.
+
+    Returns:
+        tuple: (resized_base64, was_resized, actual_width, actual_height)
+    """
+    try:
+        image_bytes = base64.b64decode(chunk_base64)
+        image = Image.open(BytesIO(image_bytes))
+        actual_width, actual_height = image.size
+
+        target_w = expected_width or actual_width
+        target_h = expected_height or actual_height
+
+        if actual_width == target_w and actual_height == target_h:
+            del image_bytes
+            image.close()
+            return chunk_base64, False, actual_width, actual_height
+
+        # LANCZOS 리사이즈 (merge_images와 동일 알고리즘)
+        image = image.convert("RGB")
+        image = image.resize((target_w, target_h), Image.Resampling.LANCZOS)
+
+        buf = BytesIO()
+        image.save(buf, format="JPEG", quality=95)
+        resized_base64 = base64.b64encode(buf.getvalue()).decode()
+
+        del image_bytes
+        buf.close()
+        image.close()
+
+        return resized_base64, True, actual_width, actual_height
+    except Exception as e:
+        logger.warning(f"[ResizeChunk] Failed: {e}")
+        return chunk_base64, False, 0, 0
+
+
 def validate_chunk(chunk_base64, expected_width=None, expected_height=None, tolerance=0.3):
     """
     청크 이미지 검증
@@ -2785,6 +2826,14 @@ def validate_image_chunks():
                 })
                 continue
 
+            # Gemini 출력 → 원본 크기로 리사이즈 (Gemini는 입력과 다른 해상도로 반환)
+            if expected_width or expected_height:
+                chunk_base64, was_resized, orig_w, orig_h = resize_chunk_to_original(
+                    chunk_base64, expected_width, expected_height
+                )
+                if was_resized:
+                    logger.info(f"[ValidateImageChunks] chunk {chunk_index}: resized {orig_w}x{orig_h} → {expected_width}x{expected_height}")
+
             # 텍스트 없는 청크는 검증 건너뛰기 (정상 처리)
             if not has_text:
                 valid_chunks.append({
@@ -3521,11 +3570,23 @@ def process_retry_result():
                 still_invalid += 1
                 continue
 
+            # Gemini 출력 → 원본 크기로 리사이즈
+            retry_expected_w = chunk.get("width")
+            retry_expected_h = chunk.get("height")
+            if retry_expected_w or retry_expected_h:
+                chunk_base64, was_resized, orig_w, orig_h = resize_chunk_to_original(
+                    chunk_base64, retry_expected_w, retry_expected_h
+                )
+                if was_resized:
+                    logger.info(f"[ProcessRetryResult] chunk {chunk_index}: resized {orig_w}x{orig_h} → {retry_expected_w}x{retry_expected_h}")
+
             # 검증 (source_lang이 있으면 이중 검사)
             validation = validate_translated_chunk(
                 chunk_base64,
                 target_lang=target_lang,
                 source_lang=source_lang,
+                expected_width=retry_expected_w,
+                expected_height=retry_expected_h,
                 skip_ocr=False
             )
 
