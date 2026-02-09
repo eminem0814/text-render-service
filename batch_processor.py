@@ -391,23 +391,31 @@ def check_and_complete_images(
 
             if len(sorted_chunks) == 1:
                 chunk_image = base64_to_image_func(sorted_chunks[0]["base64"])
-                merged_base64, _ = image_to_base64_func(chunk_image, format=pil_format, quality=output_quality)
+                merged_base64, actual_fmt = image_to_base64_func(chunk_image, format=pil_format, quality=output_quality)
             else:
                 merged_image = merge_images_func(
                     sorted_chunks, overlap=0, blend_height=50
                 )
-                merged_base64, _ = image_to_base64_func(merged_image, format=pil_format, quality=output_quality)
+                merged_base64, actual_fmt = image_to_base64_func(merged_image, format=pil_format, quality=output_quality)
+
+            # WebP → JPEG 폴백 시 확장자/MIME 조정
+            actual_extension = output_extension
+            actual_mime = mime_type
+            if actual_fmt != pil_format:
+                logger.info(f"[CheckComplete] Format fallback: {pil_format} → {actual_fmt} for image {image_id}")
+                actual_extension = ".jpg" if actual_fmt == "JPEG" else f".{actual_fmt.lower()}"
+                actual_mime = "image/jpeg" if actual_fmt == "JPEG" else mime_type
 
             # 업로드
             image_num = str(image_index + 1).zfill(2)
-            file_name = f"{table_name}/{target_lang_code}/{table_name}_ID{product_id}_{image_num}_{target_lang_code}{output_extension}"
+            file_name = f"{table_name}/{target_lang_code}/{table_name}_ID{product_id}_{image_num}_{target_lang_code}{actual_extension}"
             upload_url = f"{supabase_url}/storage/v1/object/{storage_bucket}/{file_name}"
 
             upload_response = requests.post(
                 upload_url,
                 headers={
                     "Authorization": f"Bearer {supabase_key}",
-                    "Content-Type": mime_type,
+                    "Content-Type": actual_mime,
                     "x-upsert": "true"
                 },
                 data=base64.b64decode(merged_base64),

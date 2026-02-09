@@ -973,6 +973,12 @@ def merge_images_internal(chunks: list, original_width: int, output_format: str 
         if pil_format == "JPG":
             pil_format = "JPEG"
 
+        # WebP 크기 제한 체크 (16383px)
+        WEBP_MAX_DIMENSION = 16383
+        if pil_format == "WEBP" and (max_width > WEBP_MAX_DIMENSION or total_height > WEBP_MAX_DIMENSION):
+            logger.warning(f"[MergeInternal] Image {max_width}x{total_height} exceeds WebP limit ({WEBP_MAX_DIMENSION}px). Falling back to JPEG.")
+            pil_format = "JPEG"
+
         if pil_format == "WEBP":
             merged.save(buffer, format="WEBP", quality=output_quality, method=4)
         elif pil_format == "JPEG":
@@ -987,6 +993,7 @@ def merge_images_internal(chunks: list, original_width: int, output_format: str 
             "merged_base64": merged_base64,
             "width": max_width,
             "height": total_height,
+            "actual_format": pil_format,
             "error": ""
         }
 
@@ -3007,6 +3014,12 @@ def merge_and_save_image():
                 "error": f"병합 실패: {merge_result['error']}"
             }), 400
 
+        # WebP → JPEG 폴백 시 확장자/MIME 조정
+        actual_format = merge_result.get("actual_format", output_format)
+        if actual_format != output_format:
+            logger.info(f"[MergeAndSave] Format fallback: {output_format} → {actual_format}")
+            output_extension = ".jpg" if actual_format == "JPEG" else f".{actual_format.lower()}"
+
         # Supabase Storage에 업로드
         storage_path = f"{product_id}/{image_index}{output_extension}"
 
@@ -3016,7 +3029,7 @@ def merge_and_save_image():
             "JPG": "image/jpeg",
             "PNG": "image/png"
         }
-        mime_type = mime_types.get(output_format, "image/webp")
+        mime_type = mime_types.get(actual_format, "image/webp")
 
         upload_result = upload_to_supabase_storage(
             merge_result["merged_base64"],
