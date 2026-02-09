@@ -2529,16 +2529,33 @@ def complete_batch(batch_id):
         if not table_name:
             return jsonify({"error": "tableName required in config"}), 400
 
+        # batch_jobs에서 전체 config 조회 (check_and_complete_images에 필요)
+        merge_config = dict(config)
+        if not merge_config.get("supabaseUrl"):
+            success_bj, bj_records = supabase_request(
+                "GET",
+                f"batch_jobs?id=eq.{batch_id}&select=config",
+                supabase_url, supabase_key
+            )
+            if success_bj and bj_records and bj_records[0].get("config"):
+                merge_config = bj_records[0]["config"]
+        # fallback 보장
+        merge_config.setdefault("supabaseUrl", supabase_url)
+        merge_config.setdefault("supabaseKey", supabase_key)
+        merge_config.setdefault("tableName", table_name)
+
         # partial 이미지 병합 시도 (청크가 모두 valid/replaced면 completed로 전환)
         try:
             merge_result = check_and_complete_images(
-                batch_id, config,
+                batch_id, merge_config,
                 base64_to_image, image_to_base64, merge_images
             )
             if merge_result.get("completed", 0) > 0:
                 logger.info(f"[CompleteBatch] Merged {merge_result['completed']} images")
         except Exception as e:
             logger.warning(f"[CompleteBatch] check_and_complete_images error: {e}")
+            import traceback
+            traceback.print_exc()
 
         # 진행 상황 확인
         progress = get_batch_progress(batch_id, supabase_url, supabase_key)
