@@ -3282,11 +3282,11 @@ def get_all_defective_chunks():
 
         image_ids = [r["id"] for r in ip_result]
 
-        # chunk_processing에서 불량 청크 조회 (retry_count < 3)
-        MAX_RETRY_COUNT = 3
+        # chunk_processing에서 불량 청크 조회 (invalid/pending/retrying 모두 포함)
+        # retry_count 필터 제거 — create-retry-batch에서 retry_count >= 3이면 replaced 처리
         success, chunks = supabase_request(
             "GET",
-            f"chunk_processing?image_processing_id=in.({','.join(map(str, image_ids))})&status=in.(invalid,pending)&retry_count=lt.{MAX_RETRY_COUNT}&select=*",
+            f"chunk_processing?image_processing_id=in.({','.join(map(str, image_ids))})&status=in.(invalid,pending,retrying)&select=*",
             supabase_url, supabase_key
         )
 
