@@ -854,6 +854,18 @@ def validate_translated_chunk(
                 result["can_retry"] = True  # 번역 실패는 재처리 가능
                 return result
 
+            # 3. 깨진 글자 검증 (OCR confidence 기반)
+            detected_texts = lang_result.get("detected_text", [])
+            if len(detected_texts) >= 3:
+                low_conf = [t for t in detected_texts if t["confidence"] < 0.7]
+                low_conf_ratio = len(low_conf) / len(detected_texts)
+                if low_conf_ratio > 0.5:
+                    result["valid"] = False
+                    result["defect_type"] = "garbled"
+                    result["reason"] = f"깨진 글자 의심: 저신뢰 텍스트 {low_conf_ratio:.0%} ({len(low_conf)}/{len(detected_texts)}개)"
+                    result["can_retry"] = True
+                    return result
+
         except Exception as e:
             logger.warning(f"번역 언어 검증 스킵 (오류): {e}")
             result["translation_validation"] = {
