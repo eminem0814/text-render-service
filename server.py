@@ -778,7 +778,7 @@ def validate_translated_chunk(
     expected_width: int = None,
     expected_height: int = None,
     size_tolerance: float = 0.3,
-    lang_threshold: float = 0.2,
+    lang_threshold: float = 0.15,
     skip_ocr: bool = False
 ) -> dict:
     """
@@ -2887,7 +2887,7 @@ def validate_image_chunks():
                 expected_width=expected_width,
                 expected_height=expected_height,
                 size_tolerance=0.3,
-                lang_threshold=0.2,
+                lang_threshold=0.15,
                 skip_ocr=skip_ocr
             )
 
