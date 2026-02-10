@@ -2696,8 +2696,36 @@ def get_batch_images():
         if not gemini_file_name or not gemini_api_key:
             return jsonify({"error": "gemini_file_name and gemini_api_key required"}), 400
 
+        import gc
+
         logger.info(f"[GetBatchImages] Processing: {gemini_file_name}")
         logger.info(f"[GetBatchImages] Chunk metadata count: {len(chunk_metadata)}")
+
+        # 0. chunk_metadata에서 대상 이미지 키를 미리 계산 (메모리 최적화)
+        # limit/offset이 있으면 해당 범위의 이미지만 base64 추출
+        meta_by_key = {m["key"]: m for m in chunk_metadata}
+
+        # 이미지 키 목록을 chunk_metadata에서 미리 계산
+        image_key_set = {}
+        for m in chunk_metadata:
+            ik = f"{m['productId']}_{m['imageIndex']}"
+            if ik not in image_key_set:
+                image_key_set[ik] = {
+                    "product_id": m["productId"],
+                    "image_index": m["imageIndex"],
+                }
+        sorted_image_keys = sorted(image_key_set.keys(), key=lambda k: (image_key_set[k]["product_id"], image_key_set[k]["image_index"]))
+        total_images = len(sorted_image_keys)
+
+        # 대상 범위의 이미지 키만 선별
+        if limit is not None:
+            target_image_keys = set(sorted_image_keys[offset:offset + limit])
+            has_more = (offset + limit) < total_images
+        else:
+            target_image_keys = set(sorted_image_keys)
+            has_more = False
+
+        logger.info(f"[GetBatchImages] Total images: {total_images}, target: {len(target_image_keys)} (offset={offset}, limit={limit})")
 
         # 1. Gemini 결과 파일 다운로드
         download_url = f"https://generativelanguage.googleapis.com/download/v1beta/{gemini_file_name}:download?alt=media"
@@ -2717,16 +2745,19 @@ def get_batch_images():
         jsonl_content = download_response.text
         logger.info(f"[GetBatchImages] Downloaded {len(jsonl_content)} bytes")
 
-        # 2. JSONL 파싱
-        lines = jsonl_content.strip().split('\n')
+        # 다운로드 응답 즉시 해제
+        del download_response
+        gc.collect()
 
-        # custom_id로 청크 메타데이터 인덱싱
-        meta_by_key = {m["key"]: m for m in chunk_metadata}
+        # 2. JSONL 파싱 (대상 이미지만 base64 추출)
+        lines = jsonl_content.split('\n')
+        del jsonl_content
+        gc.collect()
 
-        # 이미지별로 청크 그룹핑
         image_chunks = {}
+        skipped_count = 0
 
-        for line_num, line in enumerate(lines):
+        for line in lines:
             if not line.strip():
                 continue
 
@@ -2743,6 +2774,13 @@ def get_batch_images():
             if not meta:
                 continue
 
+            image_key = f"{meta['productId']}_{meta['imageIndex']}"
+
+            # 대상 이미지가 아니면 base64 추출 스킵 (메모리 절약)
+            if image_key not in target_image_keys:
+                skipped_count += 1
+                continue
+
             # 이미지 데이터 추출
             translated_base64 = None
             candidates = response_data.get("response", {}).get("candidates", [])
@@ -2757,8 +2795,6 @@ def get_batch_images():
             if not translated_base64:
                 logger.warning(f"[GetBatchImages] No image data for {custom_id}")
                 continue
-
-            image_key = f"{meta['productId']}_{meta['imageIndex']}"
 
             if image_key not in image_chunks:
                 image_chunks[image_key] = {
@@ -2779,26 +2815,27 @@ def get_batch_images():
                 "has_text": meta.get("hasText", True)
             })
 
+        # JSONL lines 해제
+        del lines
+        gc.collect()
+
+        if skipped_count > 0:
+            logger.info(f"[GetBatchImages] Skipped {skipped_count} chunks (not in target range)")
+
         # 이미지 리스트로 변환 (청크 정렬)
-        all_images = []
-        for image_key, image_data in image_chunks.items():
-            image_data["chunks"] = sorted(image_data["chunks"], key=lambda x: x["index"])
-            all_images.append(image_data)
+        images = []
+        for image_key in sorted_image_keys:
+            if image_key in image_chunks:
+                image_data = image_chunks[image_key]
+                image_data["chunks"] = sorted(image_data["chunks"], key=lambda x: x["index"])
+                images.append(image_data)
 
-        # 이미지 키 기준 정렬 (일관된 순서 보장)
-        all_images = sorted(all_images, key=lambda x: (x["product_id"], x["image_index"]))
-
-        total_images = len(all_images)
-        logger.info(f"[GetBatchImages] Grouped into {total_images} images")
-
-        # limit/offset 적용 (메모리 절약)
+        # 대상 범위만 필터 (limit 없으면 전체)
         if limit is not None:
-            images = all_images[offset:offset + limit]
-            has_more = (offset + limit) < total_images
-            logger.info(f"[GetBatchImages] Returning {len(images)} images (offset={offset}, limit={limit}, has_more={has_more})")
-        else:
-            images = all_images
-            has_more = False
+            # 이미 target_image_keys로 필터됨, images가 곧 결과
+            pass
+
+        logger.info(f"[GetBatchImages] Returning {len(images)} images (offset={offset}, limit={limit}, has_more={has_more})")
 
         return jsonify({
             "success": True,
