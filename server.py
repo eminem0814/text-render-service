@@ -2692,6 +2692,7 @@ def get_batch_images():
         batch_job_id = data.get("batch_job_id")
         limit = data.get("limit")  # 반환할 이미지 수 제한 (메모리 절약)
         offset = data.get("offset", 0)  # 시작 위치
+        is_retry = data.get("is_retry", False)  # retry 배치 여부
 
         if not gemini_file_name or not gemini_api_key:
             return jsonify({"error": "gemini_file_name and gemini_api_key required"}), 400
@@ -2718,14 +2719,19 @@ def get_batch_images():
         total_images = len(sorted_image_keys)
 
         # 대상 범위의 이미지 키만 선별
-        if limit is not None:
+        if is_retry:
+            # retry 모드: 모든 청크를 허용 (파싱 후 실제 found 이미지로 pagination)
+            target_image_keys = set(sorted_image_keys)
+            has_more = False  # 파싱 후 재계산
+            logger.info(f"[GetBatchImages] Retry mode: allowing all chunks, will paginate after parsing")
+        elif limit is not None:
             target_image_keys = set(sorted_image_keys[offset:offset + limit])
             has_more = (offset + limit) < total_images
         else:
             target_image_keys = set(sorted_image_keys)
             has_more = False
 
-        logger.info(f"[GetBatchImages] Total images: {total_images}, target: {len(target_image_keys)} (offset={offset}, limit={limit})")
+        logger.info(f"[GetBatchImages] Total images: {total_images}, target: {len(target_image_keys)} (offset={offset}, limit={limit}, is_retry={is_retry})")
 
         # 1. Gemini 결과 파일 다운로드
         download_url = f"https://generativelanguage.googleapis.com/download/v1beta/{gemini_file_name}:download?alt=media"
@@ -2823,17 +2829,36 @@ def get_batch_images():
             logger.info(f"[GetBatchImages] Skipped {skipped_count} chunks (not in target range)")
 
         # 이미지 리스트로 변환 (청크 정렬)
-        images = []
-        for image_key in sorted_image_keys:
-            if image_key in image_chunks:
-                image_data = image_chunks[image_key]
-                image_data["chunks"] = sorted(image_data["chunks"], key=lambda x: x["index"])
-                images.append(image_data)
+        if is_retry:
+            # retry 모드: 실제 파일에서 찾은 이미지만으로 pagination
+            found_keys = sorted(
+                image_chunks.keys(),
+                key=lambda k: (image_chunks[k]["product_id"], image_chunks[k]["image_index"])
+            )
+            retry_total = len(found_keys)
 
-        # 대상 범위만 필터 (limit 없으면 전체)
-        if limit is not None:
-            # 이미 target_image_keys로 필터됨, images가 곧 결과
-            pass
+            if limit is not None:
+                page_keys = found_keys[offset:offset + limit]
+                has_more = (offset + limit) < retry_total
+            else:
+                page_keys = found_keys
+                has_more = False
+
+            images = []
+            for key in page_keys:
+                img_data = image_chunks[key]
+                img_data["chunks"] = sorted(img_data["chunks"], key=lambda x: x["index"])
+                images.append(img_data)
+
+            total_images = retry_total
+            logger.info(f"[GetBatchImages] Retry: found {retry_total} images in file, returning {len(images)} (offset={offset}, limit={limit})")
+        else:
+            images = []
+            for image_key in sorted_image_keys:
+                if image_key in image_chunks:
+                    image_data = image_chunks[image_key]
+                    image_data["chunks"] = sorted(image_data["chunks"], key=lambda x: x["index"])
+                    images.append(image_data)
 
         logger.info(f"[GetBatchImages] Returning {len(images)} images (offset={offset}, limit={limit}, has_more={has_more})")
 
