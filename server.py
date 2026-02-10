@@ -451,7 +451,7 @@ def count_target_language_chars(text: str, target_lang: str) -> int:
                 count += 1
 
         # 영어/유럽어 (라틴 문자)
-        elif target_lang in ["en", "de", "fr", "es", "it", "pt"]:
+        elif target_lang in ["en", "de", "fr", "es", "it", "pt", "ms", "id"]:
             if (0x0041 <= code <= 0x005A or  # A-Z
                 0x0061 <= code <= 0x007A or  # a-z
                 0x00C0 <= code <= 0x00FF):   # 확장 라틴
