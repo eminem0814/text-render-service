@@ -92,7 +92,7 @@ def get_ocr_reader(target_lang: str):
         import logging as _logging
         _logging.getLogger('ppocr').setLevel(_logging.WARNING)
 
-        well_supported_langs = {"ch", "chinese_cht", "en", "japan"}
+        well_supported_langs = {"ch", "chinese_cht", "en", "japan", "korean"}
 
         if paddle_lang in well_supported_langs:
             _current_ocr_reader = PaddleOCR(
@@ -198,6 +198,16 @@ def validate_translation_language(
                 pass  # PaddleOCR은 그레이스케일도 처리 가능
             elif len(image_np.shape) == 3 and image_np.shape[2] == 4:  # RGBA
                 image_np = cv2.cvtColor(image_np, cv2.COLOR_RGBA2RGB)
+
+        # OCR 메모리 절약: 긴 변이 1200px 이하로 다운스케일
+        h, w = image_np.shape[:2]
+        max_side = max(h, w)
+        if max_side > 1200:
+            scale = 1200.0 / max_side
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            image_np = cv2.resize(image_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            logger.info(f"[OCR] 다운스케일: {w}x{h} → {new_w}x{new_h}")
 
         # ================================================================
         # 이중 검사: source_lang이 제공된 경우 원본 언어 리더로 검사
@@ -2964,6 +2974,9 @@ def validate_image_chunks():
         import gc
         valid_chunks = []
         defective_chunks = []
+
+        # 메모리 절약: 청크 처리 전 GC
+        gc.collect()
 
         for i, chunk in enumerate(chunks):
             chunk_index = chunk.get("index")
