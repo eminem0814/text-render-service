@@ -1314,13 +1314,56 @@ def merge_images(chunks, overlap=0, blend_height=50, target_width=None, target_h
     return result
 
 
+def download_image_from_url(url, max_size=100*1024*1024, timeout=60):
+    """URL에서 이미지를 스트리밍 다운로드하여 PIL Image로 반환
+
+    Args:
+        url: 이미지 URL
+        max_size: 최대 파일 크기 (기본 100MB)
+        timeout: 다운로드 타임아웃 (초)
+
+    Returns:
+        PIL Image (RGB), base64 문자열
+    """
+    import tempfile
+    response = requests.get(url, stream=True, timeout=timeout)
+    response.raise_for_status()
+
+    content_length = response.headers.get('Content-Length')
+    if content_length and int(content_length) > max_size:
+        raise ValueError(f"Image too large: {content_length} bytes (max {max_size})")
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.img')
+    downloaded = 0
+    try:
+        for chunk in response.iter_content(chunk_size=8192):
+            downloaded += len(chunk)
+            if downloaded > max_size:
+                raise ValueError(f"Image exceeded max size during download: {downloaded} bytes")
+            tmp.write(chunk)
+        tmp.close()
+
+        image = Image.open(tmp.name).convert("RGB")
+
+        # 슬라이스 불필요 시 base64 반환용
+        with open(tmp.name, 'rb') as f:
+            image_base64 = base64.b64encode(f.read()).decode('utf-8')
+
+        logger.info(f"Downloaded image from URL: {downloaded} bytes, {image.size[0]}x{image.size[1]}")
+        return image, image_base64
+    finally:
+        if os.path.exists(tmp.name):
+            os.unlink(tmp.name)
+
+
 @app.route("/slice-image", methods=["POST"])
 def slice_image_endpoint():
     """
     긴 이미지를 청크로 분할
 
     Request:
-        image_base64: Base64 인코딩된 이미지
+        image_base64: Base64 인코딩된 이미지 (image_url과 택 1)
+        image_url: 이미지 URL — 서버가 직접 다운로드 (image_base64와 택 1)
         chunk_height: 청크 높이 (기본 3000)
         use_smart_cut: 스마트 컷 사용 여부 (기본 True)
         overlap: 오버랩 픽셀 (기본 0)
@@ -1333,17 +1376,22 @@ def slice_image_endpoint():
     try:
         data = request.get_json()
         image_base64_input = data.get("image_base64")
+        image_url = data.get("image_url")
         chunk_height = data.get("chunk_height", 3000)
         use_smart_cut = data.get("use_smart_cut", True)
         overlap = data.get("overlap", 0)
 
-        if not image_base64_input:
-            return jsonify({"error": "image_base64 required"}), 400
-
-        # 이미지 로드
-        image_data = base64.b64decode(image_base64_input)
-        image = Image.open(BytesIO(image_data)).convert("RGB")
-        original_width, original_height = image.size
+        if image_url:
+            # URL에서 직접 다운로드
+            image, image_base64_input = download_image_from_url(image_url)
+            original_width, original_height = image.size
+        elif image_base64_input:
+            # 기존 Base64 방식
+            image_data = base64.b64decode(image_base64_input)
+            image = Image.open(BytesIO(image_data)).convert("RGB")
+            original_width, original_height = image.size
+        else:
+            return jsonify({"error": "image_url or image_base64 required"}), 400
 
         logger.info(f"Slicing image: {original_width}x{original_height}, chunk_height={chunk_height}")
 
