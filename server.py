@@ -619,15 +619,75 @@ def _validate_by_source_lang(image_np, source_lang: str, target_lang: str, thres
     logger.info(f"[OCR 검증] {source_lang}→{target_lang}, 스크립트 구분={'가능' if distinct else '불가(FastText)'}, {letter_chars}자")
 
     if distinct:
-        return _validate_by_script_analysis(
+        result = _validate_by_script_analysis(
             all_text, letter_chars, total_chars,
             source_lang, target_lang, detected_texts
         )
+        # Script analysis가 PASS이면 원본 리더로 교차 검증
+        # (타겟 리더가 원본 스크립트를 자기 스크립트로 오인식하는 맹점 보완)
+        if result["valid"]:
+            result = _source_reader_cross_check(
+                image_np, source_lang, target_lang, result
+            )
+        return result
     else:
         return _validate_by_fasttext_check(
             all_text, letter_chars, total_chars,
             source_lang, target_lang, detected_texts
         )
+
+
+def _source_reader_cross_check(image_np, source_lang: str, target_lang: str, prev_result: dict) -> dict:
+    """
+    원본 언어 OCR 리더로 교차 검증.
+    타겟 리더의 script analysis가 PASS한 후, 원본 리더로 실제 원본 텍스트가
+    남아있는지 확인. 스크립트가 다른 언어 쌍에서만 사용 (ko→vi, ko→de 등).
+    """
+    try:
+        source_reader = get_ocr_reader(source_lang)
+        source_results = source_reader.predict(image_np)
+        if source_results is None:
+            logger.info(f"[교차검증] 원본({source_lang}) 리더도 텍스트 없음 → 기존 PASS 유지")
+            return prev_result
+
+        source_texts = _parse_ocr_results(source_results, min_confidence=0.7)
+        source_all_text = "".join([t["text"] for t in source_texts])
+        source_letter_chars = sum(1 for c in source_all_text if c.isalpha())
+
+        # 원본 스크립트 문자만 카운트 (다른 스크립트는 무시)
+        source_script_chars = 0
+        for char in source_all_text:
+            if char.isalpha():
+                script = get_char_script(ord(char))
+                if _script_matches_lang(source_lang, script):
+                    source_script_chars += 1
+
+        logger.info(
+            f"[교차검증] {source_lang}→{target_lang}: "
+            f"원본 리더 총 {source_letter_chars}자, "
+            f"원본 스크립트 {source_script_chars}자"
+        )
+
+        MIN_SOURCE_CHARS = 8
+        MIN_SOURCE_RATIO = 0.10
+        source_ratio = source_script_chars / source_letter_chars if source_letter_chars > 0 else 0.0
+
+        if source_script_chars >= MIN_SOURCE_CHARS and source_ratio >= MIN_SOURCE_RATIO:
+            return _make_invalid_result(
+                f"교차검증 실패: 원본 언어({source_lang}) 텍스트 잔존 "
+                f"(원본 리더: {source_script_chars}자, {source_ratio:.1%})",
+                total_chars=source_letter_chars,
+                source_ratio=source_ratio,
+                target_ratio=1.0 - source_ratio,
+                detected_text=source_texts
+            )
+
+        logger.info(f"[교차검증] 원본 스크립트 {source_script_chars}자 → 기존 PASS 유지")
+        return prev_result
+
+    except Exception as e:
+        logger.warning(f"[교차검증] 원본 리더 검증 실패: {e}")
+        return prev_result
 
 
 def _validate_by_target_lang(image_np, target_lang: str, threshold: float) -> dict:
