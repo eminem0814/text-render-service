@@ -652,6 +652,7 @@ def _source_reader_cross_check(image_np, source_lang: str, target_lang: str, pre
         source_results = source_reader.predict(image_np)
         if source_results is None:
             logger.info(f"[교차검증] 원본({source_lang}) 리더도 텍스트 없음 → 기존 PASS 유지")
+            prev_result["_cross_check_debug"] = {"result": "source_results_none"}
             return prev_result
 
         source_texts = _parse_ocr_results(source_results, min_confidence=0.7)
@@ -687,10 +688,18 @@ def _source_reader_cross_check(image_np, source_lang: str, target_lang: str, pre
             )
 
         logger.info(f"[교차검증] 원본 스크립트 {source_script_chars}자 → 기존 PASS 유지")
+        prev_result["_cross_check_debug"] = {
+            "source_letter_chars": source_letter_chars,
+            "source_script_chars": source_script_chars,
+            "source_ratio": source_ratio,
+            "text_sample": source_all_text[:100] if source_all_text else "",
+            "result": "pass_through"
+        }
         return prev_result
 
     except Exception as e:
         logger.warning(f"[교차검증] 원본 리더 검증 실패: {e}")
+        prev_result["_cross_check_debug"] = {"error": str(e), "result": "exception"}
         return prev_result
 
 
@@ -3372,6 +3381,7 @@ def validate_image_chunks():
                         "total_chars": tv.get("total_chars", 0),
                         "source_lang_ratio": tv.get("source_lang_ratio", 0),
                         "detected_text_count": len(tv.get("detected_text", [])),
+                        "cross_check": tv.get("_cross_check_debug"),
                     }
                 valid_chunks.append(chunk_entry)
             else:
