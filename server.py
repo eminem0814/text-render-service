@@ -659,24 +659,29 @@ def _source_reader_cross_check(image_np, source_lang: str, target_lang: str, pre
         source_all_text = "".join([t["text"] for t in source_texts])
         source_letter_chars = sum(1 for c in source_all_text if c.isalpha())
 
-        # 원본 스크립트 문자만 카운트 (다른 스크립트는 무시)
+        # 원본/타겟 스크립트 문자 카운트
         source_script_chars = 0
+        target_script_chars = 0
         for char in source_all_text:
             if char.isalpha():
                 script = get_char_script(ord(char))
                 if _script_matches_lang(source_lang, script):
                     source_script_chars += 1
+                if _script_matches_lang(target_lang, script):
+                    target_script_chars += 1
 
         logger.info(
             f"[교차검증] {source_lang}→{target_lang}: "
             f"원본 리더 총 {source_letter_chars}자, "
-            f"원본 스크립트 {source_script_chars}자"
+            f"원본 스크립트 {source_script_chars}자, "
+            f"타겟 스크립트 {target_script_chars}자"
         )
 
         MIN_SOURCE_CHARS = 8
         MIN_SOURCE_RATIO = 0.10
         source_ratio = source_script_chars / source_letter_chars if source_letter_chars > 0 else 0.0
 
+        # 1차: 원본 스크립트 직접 감지
         if source_script_chars >= MIN_SOURCE_CHARS and source_ratio >= MIN_SOURCE_RATIO:
             return _make_invalid_result(
                 f"교차검증 실패: 원본 언어({source_lang}) 텍스트 잔존 "
@@ -687,10 +692,33 @@ def _source_reader_cross_check(image_np, source_lang: str, target_lang: str, pre
                 detected_text=source_texts
             )
 
-        logger.info(f"[교차검증] 원본 스크립트 {source_script_chars}자 → 기존 PASS 유지")
+        # 2차: 원본 리더가 많은 텍스트를 감지했으나, 원본도 타겟도 아닌 스크립트
+        # → PaddleOCR의 오인식 (한국어를 CJK 등으로 인식하는 케이스)
+        # 정상 번역 이미지에서는 원본 리더가 텍스트를 거의 감지하지 못함
+        if source_letter_chars >= MIN_SOURCE_CHARS and source_script_chars < MIN_SOURCE_CHARS:
+            if target_script_chars < MIN_SOURCE_CHARS:
+                # 원본 리더가 많은 텍스트를 인식했지만, 원본도 타겟도 아닌 문자
+                # → 미번역 텍스트의 오인식일 가능성 높음
+                other_chars = source_letter_chars - source_script_chars - target_script_chars
+                logger.info(
+                    f"[교차검증] 오인식 감지: 원본 리더 {source_letter_chars}자 중 "
+                    f"원본 {source_script_chars}자, 타겟 {target_script_chars}자, 기타 {other_chars}자"
+                )
+                return _make_invalid_result(
+                    f"교차검증 실패: 원본 리더 오인식 감지 "
+                    f"(원본 리더: {source_letter_chars}자, 원본 스크립트 {source_script_chars}자, "
+                    f"타겟 스크립트 {target_script_chars}자)",
+                    total_chars=source_letter_chars,
+                    source_ratio=source_ratio,
+                    target_ratio=target_script_chars / source_letter_chars if source_letter_chars > 0 else 0.0,
+                    detected_text=source_texts
+                )
+
+        logger.info(f"[교차검증] 원본 스크립트 {source_script_chars}자, 타겟 스크립트 {target_script_chars}자 → 기존 PASS 유지")
         prev_result["_cross_check_debug"] = {
             "source_letter_chars": source_letter_chars,
             "source_script_chars": source_script_chars,
+            "target_script_chars": target_script_chars,
             "source_ratio": source_ratio,
             "text_sample": source_all_text[:100] if source_all_text else "",
             "result": "pass_through"
@@ -1253,7 +1281,7 @@ def pil_to_cv2(pil_image):
 def health():
     return jsonify({
         "status": "ok",
-        "service": "text-render-service-v10.5",
+        "service": "text-render-service-v10.6",
         "vertex_ai_available": vertex_ai_available,
         "project_id": PROJECT_ID,
         "features": ["slice", "merge", "batch-results", "translate-chunks", "prepare-batch", "ocr-validation", "original-chunk-preservation", "retry-queue"]
