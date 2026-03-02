@@ -1,10 +1,11 @@
 """
-텍스트 번역 및 렌더링 서비스 v10
+텍스트 번역 및 렌더링 서비스 v10.3
 - 긴 이미지 슬라이스/병합 지원
 - Gemini 배치 처리 결과 처리
 - 청크 번역 및 검증
-- OCR 기반 번역 언어 검증
+- OCR 기반 번역 언어 검증 (하이브리드: Script 분석 + FastText)
 - v10: 이미지 단위 처리, 청크별 검증, 재처리 루프
+- v10.3: OCR 검증 정확도 개선 - FastText 언어 감지, 스크립트 분석
 """
 
 from flask import Flask, request, jsonify
@@ -18,6 +19,7 @@ import base64
 import os
 import logging
 import json
+import warnings
 
 # PaddlePaddle PIR 비활성화 (호환성 문제 해결)
 os.environ['FLAGS_enable_pir_api'] = '0'
@@ -61,92 +63,393 @@ LANGUAGE_CODE_MAP = {
     "hi": "hi",          # 힌디어
 }
 
-# OCR Reader 단일 캐시 (메모리 절약: 항상 1개 언어 모델만 유지)
-_current_ocr_reader = None
-_current_ocr_lang = None
+# OCR Reader 멀티 캐시 (source + target 언어 동시 유지)
+_ocr_readers: dict = {}  # paddle_lang → PaddleOCR instance
+
+
+def _create_ocr_reader(paddle_lang: str):
+    """PaddleOCR Reader 인스턴스 생성."""
+    import logging as _logging
+    _logging.getLogger('ppocr').setLevel(_logging.WARNING)
+
+    well_supported_langs = {"ch", "chinese_cht", "en", "japan", "korean"}
+
+    if paddle_lang in well_supported_langs:
+        reader = PaddleOCR(
+            lang=paddle_lang,
+            text_detection_model_name="PP-OCRv5_mobile_det",
+            text_recognition_model_name="PP-OCRv5_mobile_rec",
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            text_det_limit_side_len=736,
+            text_det_limit_type='max',
+            text_det_box_thresh=0.5,
+            text_det_thresh=0.3,
+            text_det_unclip_ratio=1.6,
+            text_rec_score_thresh=0.5,
+        )
+        logger.info(f"PaddleOCR Reader 생성 (mobile_rec): {paddle_lang}")
+    else:
+        reader = PaddleOCR(
+            lang=paddle_lang,
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            text_det_limit_side_len=736,
+            text_det_limit_type='max',
+            text_det_box_thresh=0.5,
+            text_det_thresh=0.3,
+            text_det_unclip_ratio=1.6,
+            text_rec_score_thresh=0.5,
+        )
+        logger.info(f"PaddleOCR Reader 생성 (auto model): {paddle_lang}")
+
+    return reader
+
 
 def get_ocr_reader(target_lang: str):
     """
-    대상 언어에 맞는 PaddleOCR Reader를 반환 (단일 캐시)
+    대상 언어에 맞는 PaddleOCR Reader를 반환 (멀티 캐시).
 
-    메모리 절약을 위해 한 번에 1개 언어 모델만 유지.
-    다른 언어 요청 시 기존 모델 해제 후 새 모델 로딩.
+    source + target 언어 모델을 동시에 메모리에 유지하여
+    언어 전환 시 모델 재생성 비용을 제거.
     """
-    global _current_ocr_reader, _current_ocr_lang
-    import gc
+    global _ocr_readers
 
     paddle_lang = LANGUAGE_CODE_MAP.get(target_lang, "en")
 
-    if _current_ocr_lang == paddle_lang and _current_ocr_reader is not None:
-        return _current_ocr_reader
-
-    # 기존 모델 해제
-    if _current_ocr_reader is not None:
-        logger.info(f"PaddleOCR Reader 교체: {_current_ocr_lang} → {paddle_lang}")
-        del _current_ocr_reader
-        _current_ocr_reader = None
-        _current_ocr_lang = None
-        gc.collect()
+    if paddle_lang in _ocr_readers:
+        return _ocr_readers[paddle_lang]
 
     try:
-        import logging as _logging
-        _logging.getLogger('ppocr').setLevel(_logging.WARNING)
-
-        well_supported_langs = {"ch", "chinese_cht", "en", "japan", "korean"}
-
-        if paddle_lang in well_supported_langs:
-            _current_ocr_reader = PaddleOCR(
-                lang=paddle_lang,
-                text_detection_model_name="PP-OCRv5_mobile_det",
-                text_recognition_model_name="PP-OCRv5_mobile_rec",
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False,
-                text_det_limit_side_len=736,
-                text_det_limit_type='max',
-                text_det_box_thresh=0.5,
-                text_det_thresh=0.3,
-                text_det_unclip_ratio=1.6,
-                text_rec_score_thresh=0.3,
-            )
-            logger.info(f"PaddleOCR Reader 생성 (mobile_rec): {paddle_lang}")
-        else:
-            _current_ocr_reader = PaddleOCR(
-                lang=paddle_lang,
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False,
-                text_det_limit_side_len=736,
-                text_det_limit_type='max',
-                text_det_box_thresh=0.5,
-                text_det_thresh=0.3,
-                text_det_unclip_ratio=1.6,
-                text_rec_score_thresh=0.3,
-            )
-            logger.info(f"PaddleOCR Reader 생성 (auto model): {paddle_lang}")
-
-        _current_ocr_lang = paddle_lang
-
+        reader = _create_ocr_reader(paddle_lang)
+        _ocr_readers[paddle_lang] = reader
     except Exception as e:
         logger.error(f"PaddleOCR Reader 생성 실패: {e}")
-        if _current_ocr_reader is None:
-            _current_ocr_reader = PaddleOCR(
-                lang="en",
-                text_detection_model_name="PP-OCRv5_mobile_det",
-                text_recognition_model_name="PP-OCRv5_mobile_rec",
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False,
-                text_det_limit_side_len=736,
-                text_det_limit_type='max',
-                text_det_box_thresh=0.5,
-                text_det_thresh=0.3,
-                text_det_unclip_ratio=1.6,
-                text_rec_score_thresh=0.3,
-            )
-            _current_ocr_lang = "en"
+        if "en" not in _ocr_readers:
+            _ocr_readers["en"] = _create_ocr_reader("en")
+        return _ocr_readers["en"]
 
-    return _current_ocr_reader
+    return _ocr_readers[paddle_lang]
+
+
+def warmup_ocr_models():
+    """서버 시작 시 OCR 모델 사전 로딩 (콜드 스타트 방지)."""
+    import sys, time
+    warmup_langs = os.environ.get("OCR_WARMUP_LANGS", "ko,en").split(",")
+    logger.info(f"[Warmup] OCR 모델 워밍업 시작: {warmup_langs}")
+    start = time.time()
+    for lang in warmup_langs:
+        lang = lang.strip()
+        if lang:
+            logger.info(f"[Warmup] OCR 모델 로딩: {lang}")
+            sys.stderr.flush()
+            get_ocr_reader(lang)
+    elapsed = time.time() - start
+    # PaddleOCR 초기화가 stdout/stderr를 점유하므로 flush 후 로깅
+    sys.stdout.flush()
+    sys.stderr.flush()
+    logger.info(f"[Warmup] OCR 모델 워밍업 완료: {list(_ocr_readers.keys())} ({elapsed:.1f}초)")
+    print(f"[Warmup] OCR 워밍업 완료: {list(_ocr_readers.keys())} ({elapsed:.1f}초)", flush=True)
+
+
+# ===== FastText 언어 감지 설정 =====
+warnings.filterwarnings("ignore", message=".*load_model.*")
+_fasttext_model = None
+
+def get_fasttext_model():
+    """FastText 언어 감지 모델 싱글턴 로딩 (lazy load, ~3MB)."""
+    global _fasttext_model
+    if _fasttext_model is None:
+        import fasttext
+        model_path = os.environ.get("FASTTEXT_MODEL_PATH", "/app/models/lid.176.ftz")
+        _fasttext_model = fasttext.load_model(model_path)
+        logger.info(f"[FastText] 모델 로드 완료: {model_path}")
+    return _fasttext_model
+
+# FastText 언어코드 매핑 (우리 시스템 → FastText ISO 639-1)
+FASTTEXT_LANG_MAP = {
+    "ko": "ko", "en": "en", "ja": "ja",
+    "zh-CN": "zh", "zh-TW": "zh", "zh": "zh",
+    "th": "th", "vi": "vi", "ms": "ms", "id": "id",
+    "ru": "ru", "de": "de", "fr": "fr",
+    "es": "es", "it": "it", "pt": "pt",
+    "ar": "ar", "hi": "hi",
+}
+
+
+# ===== 스크립트(문자체계) 분석 시스템 =====
+# 언어 → 스크립트 그룹 매핑
+SCRIPT_GROUPS = {
+    "ko": "hangul",
+    "ja": "cjk_kana",       # CJK + 히라가나 + 가타카나
+    "zh": "cjk", "zh-CN": "cjk", "zh-TW": "cjk",
+    "ru": "cyrillic",
+    "th": "thai",
+    "vi": "latin_ext",      # 라틴 + 베트남어 성조
+    "ar": "arabic",
+    "hi": "devanagari",
+    "en": "latin", "de": "latin", "fr": "latin",
+    "es": "latin", "it": "latin", "pt": "latin",
+    "ms": "latin", "id": "latin",
+}
+
+# 스크립트 겹침 쌍 (이 쌍은 Unicode만으로 구분 불가 → FastText 필요)
+_OVERLAPPING_SCRIPT_PAIRS = {
+    frozenset({"cjk_kana", "cjk"}),      # 일본어 ↔ 중국어
+    frozenset({"latin", "latin_ext"}),    # 영어 등 ↔ 베트남어
+}
+
+
+def get_char_script(code: int) -> str:
+    """Unicode 코드포인트를 스크립트 그룹으로 분류."""
+    if 0xAC00 <= code <= 0xD7AF or 0x1100 <= code <= 0x11FF or 0x3130 <= code <= 0x318F:
+        return "hangul"
+    if 0x3040 <= code <= 0x309F or 0x30A0 <= code <= 0x30FF:
+        return "kana"
+    if 0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF or 0xF900 <= code <= 0xFAFF:
+        return "cjk"
+    if 0x0400 <= code <= 0x04FF:
+        return "cyrillic"
+    if 0x0E00 <= code <= 0x0E7F:
+        return "thai"
+    if 0x0600 <= code <= 0x06FF:
+        return "arabic"
+    if 0x0900 <= code <= 0x097F:
+        return "devanagari"
+    if 0x1EA0 <= code <= 0x1EFF:
+        return "latin_ext"
+    if (0x0041 <= code <= 0x005A or 0x0061 <= code <= 0x007A or
+            0x00C0 <= code <= 0x024F):
+        return "latin"
+    return "other"
+
+
+def _script_matches_lang(lang: str, script: str) -> bool:
+    """해당 언어가 해당 스크립트에 속하는지 판별."""
+    lang_script = SCRIPT_GROUPS.get(lang, "unknown")
+    if lang_script == script:
+        return True
+    # 일본어는 kana + cjk 모두 포함
+    if lang_script == "cjk_kana" and script in ("kana", "cjk"):
+        return True
+    # 베트남어는 latin + latin_ext 모두 포함
+    if lang_script == "latin_ext" and script == "latin":
+        return True
+    return False
+
+
+def scripts_are_distinct(source_lang: str, target_lang: str) -> bool:
+    """원본/타겟 언어의 문자 체계가 명확히 다른지 판별."""
+    s_script = SCRIPT_GROUPS.get(source_lang, "unknown")
+    t_script = SCRIPT_GROUPS.get(target_lang, "unknown")
+    if s_script == "unknown" or t_script == "unknown":
+        return False
+    if frozenset({s_script, t_script}) in _OVERLAPPING_SCRIPT_PAIRS:
+        return False
+    return s_script != t_script
+
+
+# ===== 공통 헬퍼 함수 =====
+
+def _parse_ocr_results(results, min_confidence=0.7) -> list:
+    """PaddleOCR 결과를 파싱하여 텍스트 리스트 반환. confidence 필터 적용."""
+    detected_texts = []
+    try:
+        for res in results:
+            inner_res = res.json.get('res', {}) if hasattr(res.json, 'get') else {}
+            rec_texts = inner_res.get('rec_texts', []) if hasattr(inner_res, 'get') else []
+            rec_scores = inner_res.get('rec_scores', []) if hasattr(inner_res, 'get') else []
+
+            for text, confidence in zip(rec_texts, rec_scores):
+                if confidence is None or confidence <= min_confidence:
+                    continue
+                detected_texts.append({
+                    "text": str(text),
+                    "confidence": float(confidence),
+                    "char_count": len(str(text).replace(" ", ""))
+                })
+    except Exception as e:
+        logger.error(f"OCR 결과 파싱 오류: {e}")
+    return detected_texts
+
+
+def _make_valid_result(reason, has_text=True, total_chars=0,
+                       source_ratio=0.0, target_ratio=1.0, detected_text=None):
+    """검증 통과 결과 dict 생성."""
+    return {
+        "valid": True,
+        "reason": reason,
+        "has_text": has_text,
+        "total_chars": total_chars,
+        "source_lang_ratio": source_ratio,
+        "target_lang_ratio": target_ratio,
+        "detected_text": detected_text or []
+    }
+
+
+def _make_invalid_result(reason, total_chars, source_ratio, target_ratio, detected_text):
+    """검증 실패 결과 dict 생성."""
+    return {
+        "valid": False,
+        "reason": reason,
+        "has_text": True,
+        "total_chars": total_chars,
+        "source_lang_ratio": source_ratio,
+        "target_lang_ratio": target_ratio,
+        "detected_text": detected_text
+    }
+
+
+# ===== FastText 언어 감지 =====
+
+def detect_language_fasttext(text: str, target_lang: str) -> dict:
+    """
+    FastText로 텍스트의 언어를 감지.
+    OCR 추출 텍스트에 대해 사용하며, 겹치는 스크립트 언어 구분에 활용.
+    """
+    clean_text = " ".join(text.replace("\n", " ").split()).strip()
+
+    if len(clean_text) < 3:
+        return {
+            "detected_lang": "unknown",
+            "confidence": 0.0,
+            "is_target_lang": True,
+            "top_predictions": []
+        }
+
+    model = get_fasttext_model()
+    predictions = model.predict(clean_text, k=3)
+
+    top_predictions = []
+    for label, score in zip(predictions[0], predictions[1]):
+        lang_code = label.replace("__label__", "")
+        top_predictions.append((lang_code, float(score)))
+
+    detected_lang = top_predictions[0][0] if top_predictions else "unknown"
+    confidence = top_predictions[0][1] if top_predictions else 0.0
+    ft_target = FASTTEXT_LANG_MAP.get(target_lang, target_lang)
+    is_target = detected_lang == ft_target
+
+    return {
+        "detected_lang": detected_lang,
+        "confidence": confidence,
+        "is_target_lang": is_target,
+        "top_predictions": top_predictions
+    }
+
+
+# ===== 스크립트 기반 검증 =====
+
+def _validate_by_script_analysis(
+    all_text: str, letter_chars: int, total_chars: int,
+    source_lang: str, target_lang: str, detected_texts: list
+) -> dict:
+    """
+    Unicode 스크립트 분석으로 검증.
+    원본/타겟 언어의 문자 체계가 다를 때 사용 (ko→en, ko→th 등).
+    """
+    source_count = 0
+    target_count = 0
+    for char in all_text:
+        if not char.isalpha():
+            continue
+        script = get_char_script(ord(char))
+        if _script_matches_lang(source_lang, script):
+            source_count += 1
+        if _script_matches_lang(target_lang, script):
+            target_count += 1
+
+    source_ratio = source_count / letter_chars if letter_chars > 0 else 0.0
+    target_ratio = target_count / letter_chars if letter_chars > 0 else 0.0
+
+    MIN_SOURCE_CHARS = 8
+    MIN_SOURCE_RATIO = 0.10
+
+    log_msg = (f"[Script검증] 원본({source_lang}) {source_count}자={source_ratio:.1%}, "
+               f"대상({target_lang}) {target_count}자={target_ratio:.1%}, 총 {letter_chars}자")
+    logger.info(log_msg)
+    print(log_msg, flush=True)
+    if detected_texts:
+        sample = [t['text'] for t in detected_texts[:5]]
+        logger.info(f"[Script검증] 감지 텍스트 샘플: {sample}")
+
+    if source_count >= MIN_SOURCE_CHARS and source_ratio >= MIN_SOURCE_RATIO:
+        return _make_invalid_result(
+            f"원본 언어({source_lang}) 잔존: {source_count}자 ({source_ratio:.1%})",
+            total_chars, source_ratio, target_ratio, detected_texts
+        )
+
+    return _make_valid_result(
+        f"Script 검증 통과: 원본 {source_count}자 ({source_ratio:.1%})",
+        has_text=True, total_chars=total_chars,
+        source_ratio=source_ratio, target_ratio=target_ratio,
+        detected_text=detected_texts
+    )
+
+
+# ===== FastText 기반 검증 =====
+
+def _validate_by_fasttext_check(
+    all_text: str, letter_chars: int, total_chars: int,
+    source_lang: str, target_lang: str, detected_texts: list
+) -> dict:
+    """
+    FastText 언어 감지로 검증.
+    원본/타겟 언어의 스크립트가 겹칠 때 사용 (ja↔zh, en↔fr↔de 등).
+    """
+    ft_result = detect_language_fasttext(all_text, target_lang)
+
+    detected_lang = ft_result["detected_lang"]
+    confidence = ft_result["confidence"]
+    is_target = ft_result["is_target_lang"]
+    ft_source = FASTTEXT_LANG_MAP.get(source_lang, source_lang)
+
+    log_msg = (f"[FastText검증] 감지={detected_lang} (conf={confidence:.2f}), "
+               f"타겟={target_lang}, 원본={source_lang}, 일치={is_target}")
+    logger.info(log_msg)
+    print(log_msg, flush=True)
+    logger.info(f"[FastText검증] Top3: {ft_result['top_predictions']}")
+
+    # 1. FastText가 높은 확신으로 원본 언어라고 판단 → REJECT
+    if detected_lang == ft_source and confidence > 0.7:
+        return _make_invalid_result(
+            f"원본 언어({source_lang}) 감지: FastText {detected_lang} ({confidence:.1%})",
+            total_chars, 1.0, 0.0, detected_texts
+        )
+
+    # 2. FastText가 타겟 언어로 확인 → PASS
+    if is_target and confidence > 0.5:
+        return _make_valid_result(
+            f"FastText 검증 통과: {detected_lang} ({confidence:.1%})",
+            has_text=True, total_chars=total_chars,
+            source_ratio=0.0, target_ratio=confidence,
+            detected_text=detected_texts
+        )
+
+    # 3. 짧은 텍스트 + 저신뢰도 → PASS (판단 유보)
+    if confidence < 0.3 and letter_chars < 15:
+        return _make_valid_result(
+            f"텍스트 짧아 FastText 불확실 ({letter_chars}자, conf={confidence:.2f}) - 통과",
+            has_text=True, total_chars=total_chars,
+            detected_text=detected_texts
+        )
+
+    # 4. 원본 언어가 아닌 다른 언어 → PASS (번역은 됨)
+    if detected_lang != ft_source:
+        return _make_valid_result(
+            f"FastText 통과: 원본 아님 (감지={detected_lang}, conf={confidence:.2f})",
+            has_text=True, total_chars=total_chars,
+            detected_text=detected_texts
+        )
+
+    # 5. 불확실 → PASS (benefit of doubt)
+    return _make_valid_result(
+        f"FastText 불확실 (감지={detected_lang}, conf={confidence:.2f}) - 통과 처리",
+        has_text=True, total_chars=total_chars,
+        detected_text=detected_texts
+    )
 
 
 def validate_translation_language(
@@ -157,11 +460,12 @@ def validate_translation_language(
     image_np=None
 ) -> dict:
     """
-    OCR을 사용하여 번역된 이미지가 올바른 언어인지 검증 (이중 검사)
+    OCR을 사용하여 번역된 이미지가 올바른 언어인지 검증 (하이브리드 검증)
 
     검증 방식:
-    1. source_lang이 제공된 경우: 원본 언어 리더로 "남아있으면 안 되는 텍스트" 검사
-       → 원본 언어 텍스트가 threshold 이상 감지되면 번역 실패
+    1. source_lang이 제공된 경우: 타겟 언어 OCR + 스크립트 분석/FastText
+       → 스크립트 구분 가능: Unicode 스크립트 분석 (빠르고 정확)
+       → 스크립트 겹침: FastText 언어 감지 (정확한 구분)
     2. source_lang이 없는 경우: 타겟 언어 리더로 "있어야 하는 텍스트" 검사
        → 타겟 언어 비율이 (1-threshold) 미만이면 번역 실패
 
@@ -199,24 +503,29 @@ def validate_translation_language(
             elif len(image_np.shape) == 3 and image_np.shape[2] == 4:  # RGBA
                 image_np = cv2.cvtColor(image_np, cv2.COLOR_RGBA2RGB)
 
-        # OCR 메모리 절약: 긴 변이 1200px 이하로 다운스케일
+        # OCR 메모리 절약: 긴 변이 2000px 이하로 다운스케일 (너비 최소 500px 보장)
         h, w = image_np.shape[:2]
         max_side = max(h, w)
-        if max_side > 1200:
-            scale = 1200.0 / max_side
+        min_width = 500
+        max_long_side = 2000
+        if max_side > max_long_side:
+            scale = max_long_side / max_side
+            # 너비가 min_width 이하로 줄어들면 너비 기준으로 스케일 조정
+            if int(w * scale) < min_width and w >= min_width:
+                scale = min_width / w
             new_w = int(w * scale)
             new_h = int(h * scale)
             image_np = cv2.resize(image_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
             logger.info(f"[OCR] 다운스케일: {w}x{h} → {new_w}x{new_h}")
 
         # ================================================================
-        # 이중 검사: source_lang이 제공된 경우 원본 언어 리더로 검사
+        # 하이브리드 검증: source_lang 제공시 스크립트 분석/FastText
         # ================================================================
         if source_lang:
             return _validate_by_source_lang(image_np, source_lang, target_lang, threshold)
 
         # ================================================================
-        # 기존 방식: 타겟 언어 리더로 검사
+        # 폴백: 타겟 언어 리더로 검사 (source_lang 미제공)
         # ================================================================
         return _validate_by_target_lang(image_np, target_lang, threshold)
 
@@ -236,190 +545,87 @@ def validate_translation_language(
 
 def _validate_by_source_lang(image_np, source_lang: str, target_lang: str, threshold: float) -> dict:
     """
-    원본 언어 리더로 "남아있으면 안 되는 텍스트" 검사
+    하이브리드 검증: 스크립트 분석 + FastText 언어 감지.
 
-    원본 언어 텍스트가 많이 감지되면 = 번역 실패
+    핵심 변경: 원본 언어 OCR 리더 대신 타겟 언어 OCR 리더 사용.
+    - 스크립트 구분 가능 (ko→en 등): Unicode 스크립트 분석 (빠르고 정확)
+    - 스크립트 겹침 (ja↔zh, en↔fr 등): FastText 언어 감지 (정확한 구분)
     """
-    # 원본 언어 OCR 실행
-    reader = get_ocr_reader(source_lang)
-    results = reader.predict(image_np)
-
-    if results is None:
-        return {
-            "valid": True,
-            "reason": "텍스트 없음 - 검증 통과",
-            "has_text": False,
-            "total_chars": 0,
-            "source_lang_ratio": 0.0,
-            "target_lang_ratio": 1.0,
-            "detected_text": []
-        }
-
-    # OCR 결과 파싱
-    detected_texts = []
-    total_chars = 0
-
-    try:
-        for res in results:
-            inner_res = res.json.get('res', {}) if hasattr(res.json, 'get') else {}
-            rec_texts = inner_res.get('rec_texts', []) if hasattr(inner_res, 'get') else []
-            rec_scores = inner_res.get('rec_scores', []) if hasattr(inner_res, 'get') else []
-
-            for text, confidence in zip(rec_texts, rec_scores):
-                if confidence is None or confidence <= 0.3:
-                    continue
-                detected_texts.append({
-                    "text": str(text),
-                    "confidence": float(confidence),
-                    "char_count": len(str(text).replace(" ", ""))
-                })
-                total_chars += len(str(text).replace(" ", ""))
-    except Exception as parse_error:
-        logger.error(f"OCR 결과 파싱 오류: {parse_error}")
-        return {
-            "valid": True,
-            "reason": f"OCR 파싱 오류로 통과 처리: {str(parse_error)}",
-            "has_text": False,
-            "total_chars": 0,
-            "source_lang_ratio": 0.0,
-            "target_lang_ratio": 1.0,
-            "detected_text": []
-        }
-
-    # 문자 분류: 숫자/기호/구두점은 언어 중립이므로 비율 계산에서 제외
-    all_text = "".join([t["text"] for t in detected_texts])
-    letter_chars = sum(1 for c in all_text if c.isalpha())
-
-    # 텍스트가 너무 적으면 통과 (번역 성공으로 간주)
-    if letter_chars < 5:
-        return {
-            "valid": True,
-            "reason": f"원본 언어({source_lang}) 텍스트 거의 없음 - 번역 성공",
-            "has_text": total_chars > 0,
-            "total_chars": total_chars,
-            "source_lang_ratio": 0.0,
-            "target_lang_ratio": 1.0,
-            "detected_text": detected_texts
-        }
-
-    # 원본 언어 문자 카운트 (letter_chars 기준 비율)
-    source_lang_chars = count_target_language_chars(all_text, source_lang)
-    source_ratio = source_lang_chars / letter_chars if letter_chars > 0 else 0.0
-
-    # 검증: 원본 언어 비율이 threshold 초과하면 번역 실패
-    if source_ratio > threshold:
-        return {
-            "valid": False,
-            "reason": f"번역 미완료: 원본 언어({source_lang}) {source_ratio:.1%} 남음 (허용 {threshold:.0%})",
-            "has_text": True,
-            "total_chars": total_chars,
-            "source_lang_ratio": source_ratio,
-            "target_lang_ratio": 1.0 - source_ratio,
-            "detected_text": detected_texts
-        }
-
-    return {
-        "valid": True,
-        "reason": f"번역 검증 통과: 원본 언어({source_lang}) {source_ratio:.1%}만 남음",
-        "has_text": True,
-        "total_chars": total_chars,
-        "source_lang_ratio": source_ratio,
-        "target_lang_ratio": 1.0 - source_ratio,
-        "detected_text": detected_texts
-    }
-
-
-def _validate_by_target_lang(image_np, target_lang: str, threshold: float) -> dict:
-    """
-    타겟 언어 리더로 "있어야 하는 텍스트" 검사 (기존 방식)
-    """
+    # 타겟 언어 OCR 리더 사용 (원본 리더의 오인식 문제 해결)
     reader = get_ocr_reader(target_lang)
     results = reader.predict(image_np)
 
     if results is None:
-        return {
-            "valid": True,
-            "reason": "텍스트 없음 - 검증 통과",
-            "has_text": False,
-            "total_chars": 0,
-            "source_lang_ratio": 0.0,
-            "target_lang_ratio": 1.0,
-            "detected_text": []
-        }
+        return _make_valid_result("텍스트 없음 - 검증 통과", has_text=False)
 
-    # OCR 결과 파싱
-    detected_texts = []
-    total_chars = 0
+    # OCR 결과 파싱 (confidence ≥ 0.7 필터)
+    detected_texts = _parse_ocr_results(results, min_confidence=0.7)
 
-    try:
-        for res in results:
-            inner_res = res.json.get('res', {}) if hasattr(res.json, 'get') else {}
-            rec_texts = inner_res.get('rec_texts', []) if hasattr(inner_res, 'get') else []
-            rec_scores = inner_res.get('rec_scores', []) if hasattr(inner_res, 'get') else []
-
-            for text, confidence in zip(rec_texts, rec_scores):
-                if confidence is None or confidence <= 0.3:
-                    continue
-                detected_texts.append({
-                    "text": str(text),
-                    "confidence": float(confidence),
-                    "char_count": len(str(text).replace(" ", ""))
-                })
-                total_chars += len(str(text).replace(" ", ""))
-    except Exception as parse_error:
-        logger.error(f"OCR 결과 파싱 오류: {parse_error}")
-        return {
-            "valid": True,
-            "reason": f"OCR 파싱 오류로 통과 처리: {str(parse_error)}",
-            "has_text": False,
-            "total_chars": 0,
-            "source_lang_ratio": 0.0,
-            "target_lang_ratio": 1.0,
-            "detected_text": []
-        }
-
-    # 문자 분류: 숫자/기호/구두점은 언어 중립이므로 비율 계산에서 제외
     all_text = "".join([t["text"] for t in detected_texts])
     letter_chars = sum(1 for c in all_text if c.isalpha())
+    total_chars = sum(t["char_count"] for t in detected_texts)
 
-    # 텍스트가 너무 적으면 통과
+    # 텍스트 부족 → 통과
     if letter_chars < 5:
-        return {
-            "valid": True,
-            "reason": "텍스트 적음 - 검증 통과",
-            "has_text": total_chars > 0,
-            "total_chars": total_chars,
-            "source_lang_ratio": 0.0,
-            "target_lang_ratio": 1.0,
-            "detected_text": detected_texts
-        }
+        return _make_valid_result(
+            f"텍스트 부족 ({letter_chars}자) - 검증 통과",
+            has_text=total_chars > 0, total_chars=total_chars,
+            detected_text=detected_texts
+        )
 
-    # 타겟 언어 문자 카운트 (letter_chars 기준 비율)
+    distinct = scripts_are_distinct(source_lang, target_lang)
+    logger.info(f"[OCR 검증] {source_lang}→{target_lang}, 스크립트 구분={'가능' if distinct else '불가(FastText)'}, {letter_chars}자")
+
+    if distinct:
+        return _validate_by_script_analysis(
+            all_text, letter_chars, total_chars,
+            source_lang, target_lang, detected_texts
+        )
+    else:
+        return _validate_by_fasttext_check(
+            all_text, letter_chars, total_chars,
+            source_lang, target_lang, detected_texts
+        )
+
+
+def _validate_by_target_lang(image_np, target_lang: str, threshold: float) -> dict:
+    """타겟 언어 리더로 "있어야 하는 텍스트" 검사 (source_lang 미제공 시 폴백)."""
+    reader = get_ocr_reader(target_lang)
+    results = reader.predict(image_np)
+
+    if results is None:
+        return _make_valid_result("텍스트 없음 - 검증 통과", has_text=False)
+
+    # confidence ≥ 0.7 필터 적용
+    detected_texts = _parse_ocr_results(results, min_confidence=0.7)
+
+    all_text = "".join([t["text"] for t in detected_texts])
+    letter_chars = sum(1 for c in all_text if c.isalpha())
+    total_chars = sum(t["char_count"] for t in detected_texts)
+
+    if letter_chars < 5:
+        return _make_valid_result(
+            "텍스트 적음 - 검증 통과",
+            has_text=total_chars > 0, total_chars=total_chars,
+            detected_text=detected_texts
+        )
+
     target_lang_chars = count_target_language_chars(all_text, target_lang)
     target_ratio = target_lang_chars / letter_chars if letter_chars > 0 else 1.0
     non_target_ratio = 1.0 - target_ratio
 
-    # 검증: 비타겟 언어 비율이 threshold 초과하면 번역 실패
     if non_target_ratio > threshold:
-        return {
-            "valid": False,
-            "reason": f"번역 미완료: 타겟 언어({target_lang}) 비율 {target_ratio:.1%}",
-            "has_text": True,
-            "total_chars": total_chars,
-            "source_lang_ratio": non_target_ratio,
-            "target_lang_ratio": target_ratio,
-            "detected_text": detected_texts
-        }
+        return _make_invalid_result(
+            f"번역 미완료: 타겟 언어({target_lang}) 비율 {target_ratio:.1%}",
+            total_chars, non_target_ratio, target_ratio, detected_texts
+        )
 
-    return {
-        "valid": True,
-        "reason": f"번역 검증 통과: 타겟 언어({target_lang}) 비율 {target_ratio:.1%}",
-        "has_text": True,
-        "total_chars": total_chars,
-        "source_lang_ratio": 1.0 - target_ratio,
-        "target_lang_ratio": target_ratio,
-        "detected_text": detected_texts
-    }
+    return _make_valid_result(
+        f"번역 검증 통과: 타겟 언어({target_lang}) 비율 {target_ratio:.1%}",
+        has_text=True, total_chars=total_chars,
+        source_ratio=1.0 - target_ratio, target_ratio=target_ratio,
+        detected_text=detected_texts
+    )
 
 
 def count_target_language_chars(text: str, target_lang: str) -> int:
@@ -864,12 +1070,12 @@ def validate_translated_chunk(
                 result["can_retry"] = True  # 번역 실패는 재처리 가능
                 return result
 
-            # 3. 깨진 글자 검증 (OCR confidence 기반)
+            # 3. 깨진 글자 검증 (OCR confidence 기반, 임계값 상향)
             detected_texts = lang_result.get("detected_text", [])
             if len(detected_texts) >= 3:
-                low_conf = [t for t in detected_texts if t["confidence"] < 0.7]
+                low_conf = [t for t in detected_texts if t["confidence"] < 0.85]
                 low_conf_ratio = len(low_conf) / len(detected_texts)
-                if low_conf_ratio > 0.5:
+                if low_conf_ratio > 0.6:
                     result["valid"] = False
                     result["defect_type"] = "garbled"
                     result["reason"] = f"깨진 글자 의심: 저신뢰 텍스트 {low_conf_ratio:.0%} ({len(low_conf)}/{len(detected_texts)}개)"
@@ -1747,12 +1953,13 @@ def translate_chunks():
                     request_body = {
                         "contents": [{
                             "parts": [
-                                {"text": prompt},
-                                {"inline_data": {"mime_type": "image/jpeg", "data": chunk_base64}}
+                                {"inline_data": {"mime_type": "image/jpeg", "data": chunk_base64}},
+                                {"text": prompt}
                             ]
                         }],
                         "generationConfig": {
-                            "responseModalities": ["TEXT", "IMAGE"]
+                            "responseModalities": ["TEXT", "IMAGE"],
+                            "mediaResolution": "MEDIA_RESOLUTION_HIGH"
                         }
                     }
 
@@ -2078,12 +2285,13 @@ def prepare_batch():
                         "request": {
                             "contents": [{
                                 "parts": [
-                                    {"text": prompt},
-                                    {"inline_data": {"mime_type": "image/jpeg", "data": chunk["base64"]}}
+                                    {"inline_data": {"mime_type": "image/jpeg", "data": chunk["base64"]}},
+                                    {"text": prompt}
                                 ]
                             }],
                             "generation_config": {
-                                "response_modalities": ["TEXT", "IMAGE"]
+                                "response_modalities": ["TEXT", "IMAGE"],
+                                "media_resolution": "MEDIA_RESOLUTION_HIGH"
                             }
                         }
                     }
@@ -2462,12 +2670,13 @@ def create_retry_batch_endpoint():
                 "request": {
                     "contents": [{
                         "parts": [
-                            {"text": prompt},
-                            {"inline_data": {"mime_type": "image/jpeg", "data": original_b64}}
+                            {"inline_data": {"mime_type": "image/jpeg", "data": original_b64}},
+                            {"text": prompt}
                         ]
                     }],
                     "generation_config": {
-                        "response_modalities": ["TEXT", "IMAGE"]
+                        "response_modalities": ["TEXT", "IMAGE"],
+                        "media_resolution": "MEDIA_RESOLUTION_HIGH"
                     }
                 }
             })
@@ -2975,9 +3184,6 @@ def validate_image_chunks():
         valid_chunks = []
         defective_chunks = []
 
-        # 메모리 절약: 청크 처리 전 GC
-        gc.collect()
-
         for i, chunk in enumerate(chunks):
             chunk_index = chunk.get("index")
             chunk_base64 = chunk.get("base64")
@@ -2997,9 +3203,11 @@ def validate_image_chunks():
                 continue
 
             # Gemini 출력 → 원본 크기로 리사이즈 (Gemini는 입력과 다른 해상도로 반환)
-            if expected_width or expected_height:
+            # width/height가 0이면 리사이즈 스킵 (잘못된 값 방어)
+            if (expected_width and expected_width > 0) or (expected_height and expected_height > 0):
                 chunk_base64, was_resized, orig_w, orig_h = resize_chunk_to_original(
-                    chunk_base64, expected_width, expected_height
+                    chunk_base64, expected_width if expected_width and expected_width > 0 else None,
+                    expected_height if expected_height and expected_height > 0 else None
                 )
                 if was_resized:
                     logger.info(f"[ValidateImageChunks] chunk {chunk_index}: resized {orig_w}x{orig_h} → {expected_width}x{expected_height}")
@@ -3022,7 +3230,7 @@ def validate_image_chunks():
                 expected_width=expected_width,
                 expected_height=expected_height,
                 size_tolerance=0.3,
-                lang_threshold=0.15,
+                lang_threshold=0.10,
                 skip_ocr=skip_ocr
             )
 
@@ -3044,14 +3252,13 @@ def validate_image_chunks():
                     "original_height": expected_height
                 })
 
-            # 메모리 정리: 1청크 처리 → 분류 → 즉시 캐시 삭제
+            # 메모리 정리: base64 참조만 해제 (gc.collect는 전체 완료 후 1회)
             chunk["base64"] = None
             chunk_base64 = None
             del validation
-            gc.collect()
-            logger.info(f"[ValidateImageChunks] chunk {chunk_index} done, gc.collect() completed")
 
         all_valid = len(defective_chunks) == 0
+        gc.collect()  # 전체 청크 처리 후 1회만 GC
 
         logger.info(f"[ValidateImageChunks] {image_key}: {len(valid_chunks)} valid, {len(defective_chunks)} defective")
 
@@ -3832,6 +4039,15 @@ def process_retry_result():
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
+
+# === 서버 시작 시 OCR 모델 워밍업 ===
+warmup_ocr_models()
+
+# PaddleOCR 초기화가 로거를 리셋하므로 재설정
+logging.basicConfig(level=logging.INFO, force=True)
+logger = logging.getLogger(__name__)
+logger.info("[Startup] 로거 재초기화 완료")
 
 
 if __name__ == "__main__":

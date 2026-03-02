@@ -10,3 +10,4 @@ vertexai>=1.38.0
 gunicorn>=21.0.0
 paddlepaddle==3.2.0
 paddleocr==3.3.3
+fasttext-wheel>=0.9.2
