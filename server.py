@@ -557,6 +557,25 @@ def _validate_by_source_lang(image_np, source_lang: str, target_lang: str, thres
     results = reader.predict(image_np)
 
     if results is None:
+        # 타겟 리더에서 텍스트가 전혀 없을 때도 원본 리더로 보조 검증
+        try:
+            source_reader = get_ocr_reader(source_lang)
+            source_results = source_reader.predict(image_np)
+            if source_results is not None:
+                source_texts = _parse_ocr_results(source_results, min_confidence=0.7)
+                source_all_text = "".join([t["text"] for t in source_texts])
+                source_letter_chars = sum(1 for c in source_all_text if c.isalpha())
+                logger.info(f"[OCR 보조검증] 타겟({target_lang}) 리더 0자(None) → 원본({source_lang}) 리더 {source_letter_chars}자")
+                if source_letter_chars >= 8:
+                    return _make_invalid_result(
+                        f"원본 언어({source_lang}) 텍스트 잔존 감지 (원본 리더: {source_letter_chars}자, 타겟 리더: 0자)",
+                        total_chars=source_letter_chars,
+                        source_ratio=1.0,
+                        target_ratio=0.0,
+                        detected_text=source_texts
+                    )
+        except Exception as e:
+            logger.warning(f"[OCR 보조검증] 원본 리더 검증 실패 (results=None): {e}")
         return _make_valid_result("텍스트 없음 - 검증 통과", has_text=False)
 
     # OCR 결과 파싱 (confidence ≥ 0.7 필터)
