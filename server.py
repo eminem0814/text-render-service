@@ -3352,12 +3352,24 @@ def validate_image_chunks():
             )
 
             if validation["valid"]:
-                valid_chunks.append({
+                chunk_entry = {
                     "index": chunk_index,
                     "key": chunk_key,
                     "base64": chunk_base64,
                     "reason": validation["reason"]
-                })
+                }
+                # 디버그: translation_validation 상세 포함
+                tv = validation.get("translation_validation")
+                if tv:
+                    chunk_entry["_debug_translation"] = {
+                        "valid": tv.get("valid"),
+                        "reason": tv.get("reason", ""),
+                        "has_text": tv.get("has_text"),
+                        "total_chars": tv.get("total_chars", 0),
+                        "source_lang_ratio": tv.get("source_lang_ratio", 0),
+                        "detected_text_count": len(tv.get("detected_text", [])),
+                    }
+                valid_chunks.append(chunk_entry)
             else:
                 defective_chunks.append({
                     "index": chunk_index,
