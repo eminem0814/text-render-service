@@ -553,6 +553,8 @@ def _validate_by_source_lang(image_np, source_lang: str, target_lang: str, thres
     - 스크립트 겹침 (ja↔zh, en↔fr 등): FastText 언어 감지 (정확한 구분)
     """
     # 타겟 언어 OCR 리더 사용 (원본 리더의 오인식 문제 해결)
+    # 교차검증용 원본 이미지 복사 (PaddleOCR predict가 image_np를 변형할 수 있음)
+    image_np_backup = image_np.copy()
     reader = get_ocr_reader(target_lang)
     results = reader.predict(image_np)
 
@@ -560,7 +562,7 @@ def _validate_by_source_lang(image_np, source_lang: str, target_lang: str, thres
         # 타겟 리더에서 텍스트가 전혀 없을 때도 원본 리더로 보조 검증
         try:
             source_reader = get_ocr_reader(source_lang)
-            source_results = source_reader.predict(image_np)
+            source_results = source_reader.predict(image_np_backup)
             if source_results is not None:
                 source_texts = _parse_ocr_results(source_results, min_confidence=0.7)
                 source_all_text = "".join([t["text"] for t in source_texts])
@@ -591,7 +593,7 @@ def _validate_by_source_lang(image_np, source_lang: str, target_lang: str, thres
         # (타겟 리더가 원본 언어 텍스트를 전혀 인식 못하는 맹점 보완)
         try:
             source_reader = get_ocr_reader(source_lang)
-            source_results = source_reader.predict(image_np)
+            source_results = source_reader.predict(image_np_backup)
             if source_results is not None:
                 source_texts = _parse_ocr_results(source_results, min_confidence=0.7)
                 source_all_text = "".join([t["text"] for t in source_texts])
@@ -627,10 +629,12 @@ def _validate_by_source_lang(image_np, source_lang: str, target_lang: str, thres
         # (타겟 리더가 원본 스크립트를 자기 스크립트로 오인식하는 맹점 보완)
         if result["valid"]:
             result = _source_reader_cross_check(
-                image_np, source_lang, target_lang, result
+                image_np_backup, source_lang, target_lang, result
             )
+        del image_np_backup
         return result
     else:
+        del image_np_backup
         return _validate_by_fasttext_check(
             all_text, letter_chars, total_chars,
             source_lang, target_lang, detected_texts
@@ -1240,7 +1244,7 @@ def pil_to_cv2(pil_image):
 def health():
     return jsonify({
         "status": "ok",
-        "service": "text-render-service-v10.4",
+        "service": "text-render-service-v10.5",
         "vertex_ai_available": vertex_ai_available,
         "project_id": PROJECT_ID,
         "features": ["slice", "merge", "batch-results", "translate-chunks", "prepare-batch", "ocr-validation", "original-chunk-preservation", "retry-queue"]
