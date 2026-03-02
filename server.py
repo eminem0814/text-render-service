@@ -1249,7 +1249,7 @@ def pil_to_cv2(pil_image):
 def health():
     return jsonify({
         "status": "ok",
-        "service": "text-render-service-v10.8",
+        "service": "text-render-service-v10.9",
         "vertex_ai_available": vertex_ai_available,
         "project_id": PROJECT_ID,
         "features": ["slice", "merge", "batch-results", "translate-chunks", "prepare-batch", "ocr-validation", "original-chunk-preservation", "retry-queue"]
@@ -2070,7 +2070,6 @@ def translate_chunks():
                         }],
                         "generationConfig": {
                             "responseModalities": ["TEXT", "IMAGE"],
-                            "mediaResolution": "MEDIA_RESOLUTION_HIGH",
                             "imageConfig": {
                                 "image_size": "1K"
                             },
