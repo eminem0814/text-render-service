@@ -4072,4 +4072,4 @@ if __name__ == "__main__":
     logger.info(f"Features: slice, merge, batch-results-v2, retry-batch, n8n-loop-api")
     logger.info(f"n8n Loop APIs: get-batch-images, validate-image-chunks, merge-and-save-image, record-defective-chunks, get-all-defective-chunks, process-retry-result")
     logger.info(f"Vertex AI available: {vertex_ai_available}")
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=port, debug=False)
