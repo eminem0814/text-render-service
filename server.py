@@ -1240,7 +1240,7 @@ def pil_to_cv2(pil_image):
 def health():
     return jsonify({
         "status": "ok",
-        "service": "text-render-service-v10.3",
+        "service": "text-render-service-v10.4",
         "vertex_ai_available": vertex_ai_available,
         "project_id": PROJECT_ID,
         "features": ["slice", "merge", "batch-results", "translate-chunks", "prepare-batch", "ocr-validation", "original-chunk-preservation", "retry-queue"]
