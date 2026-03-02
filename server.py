@@ -19,6 +19,7 @@ import base64
 import os
 import logging
 import json
+import random
 import warnings
 
 # PaddlePaddle PIR 비활성화 (호환성 문제 해결)
@@ -1959,7 +1960,14 @@ def translate_chunks():
                         }],
                         "generationConfig": {
                             "responseModalities": ["TEXT", "IMAGE"],
-                            "mediaResolution": "MEDIA_RESOLUTION_HIGH"
+                            "mediaResolution": "MEDIA_RESOLUTION_HIGH",
+                            "imageConfig": {
+                                "image_size": "1K"
+                            },
+                            "thinkingConfig": {
+                                "thinkingLevel": "HIGH",
+                                "includeThoughts": False
+                            }
                         }
                     }
 
@@ -1994,15 +2002,23 @@ def translate_chunks():
                     if success:
                         break
 
-                    # 이미지 없이 응답 완료 - 재시도 불필요
+                    # 이미지 없이 응답 완료 - Confidence Dropout 처리
                     if candidates:
                         finish_reason = candidates[0].get("finishReason", "")
                         if finish_reason == "SAFETY":
                             error_msg = "안전 필터 차단"
-                            break
+                            break  # SAFETY는 재시도 무의미
                         error_msg = f"이미지 응답 없음 (finishReason: {finish_reason})"
                     else:
                         error_msg = "응답에 candidates 없음"
+
+                    # STOP이지만 이미지 없음 = Confidence Dropout → 재시도
+                    if attempt < MAX_RETRIES - 1:
+                        retries = attempt + 1
+                        delay = min(BASE_DELAY * (2 ** attempt) + random.random(), MAX_DELAY)
+                        progress_log.append(f"  -> 이미지 없는 응답, {delay:.1f}초 후 재시도 ({attempt+1}/{MAX_RETRIES})")
+                        time.sleep(delay)
+                        continue
                     break
 
                 except requests.exceptions.Timeout:
