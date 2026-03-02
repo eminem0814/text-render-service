@@ -652,7 +652,6 @@ def _source_reader_cross_check(image_np, source_lang: str, target_lang: str, pre
         source_results = source_reader.predict(image_np)
         if source_results is None:
             logger.info(f"[교차검증] 원본({source_lang}) 리더도 텍스트 없음 → 기존 PASS 유지")
-            prev_result["_cross_check_debug"] = {"result": "source_results_none"}
             return prev_result
 
         source_texts = _parse_ocr_results(source_results, min_confidence=0.7)
@@ -693,19 +692,10 @@ def _source_reader_cross_check(image_np, source_lang: str, target_lang: str, pre
             )
 
         logger.info(f"[교차검증] 원본 스크립트 {source_script_chars}자, 타겟 스크립트 {target_script_chars}자 → 기존 PASS 유지")
-        prev_result["_cross_check_debug"] = {
-            "source_letter_chars": source_letter_chars,
-            "source_script_chars": source_script_chars,
-            "target_script_chars": target_script_chars,
-            "source_ratio": source_ratio,
-            "text_sample": source_all_text[:100] if source_all_text else "",
-            "result": "pass_through"
-        }
         return prev_result
 
     except Exception as e:
         logger.warning(f"[교차검증] 원본 리더 검증 실패: {e}")
-        prev_result["_cross_check_debug"] = {"error": str(e), "result": "exception"}
         return prev_result
 
 
@@ -1259,7 +1249,7 @@ def pil_to_cv2(pil_image):
 def health():
     return jsonify({
         "status": "ok",
-        "service": "text-render-service-v10.7",
+        "service": "text-render-service-v10.8",
         "vertex_ai_available": vertex_ai_available,
         "project_id": PROJECT_ID,
         "features": ["slice", "merge", "batch-results", "translate-chunks", "prepare-batch", "ocr-validation", "original-chunk-preservation", "retry-queue"]
@@ -3377,18 +3367,6 @@ def validate_image_chunks():
                     "base64": chunk_base64,
                     "reason": validation["reason"]
                 }
-                # 디버그: translation_validation 상세 포함
-                tv = validation.get("translation_validation")
-                if tv:
-                    chunk_entry["_debug_translation"] = {
-                        "valid": tv.get("valid"),
-                        "reason": tv.get("reason", ""),
-                        "has_text": tv.get("has_text"),
-                        "total_chars": tv.get("total_chars", 0),
-                        "source_lang_ratio": tv.get("source_lang_ratio", 0),
-                        "detected_text_count": len(tv.get("detected_text", [])),
-                        "cross_check": tv.get("_cross_check_debug"),
-                    }
                 valid_chunks.append(chunk_entry)
             else:
                 defective_chunks.append({
