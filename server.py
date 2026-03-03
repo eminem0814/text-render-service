@@ -365,7 +365,7 @@ def _validate_by_script_analysis(
     source_ratio = source_count / letter_chars if letter_chars > 0 else 0.0
     target_ratio = target_count / letter_chars if letter_chars > 0 else 0.0
 
-    MIN_SOURCE_CHARS = 8
+    MIN_SOURCE_CHARS = 3   # 이 함수는 scripts_are_distinct=True일 때만 호출됨
     MIN_SOURCE_RATIO = 0.10
 
     log_msg = (f"[Script검증] 원본({source_lang}) {source_count}자={source_ratio:.1%}, "
@@ -568,7 +568,8 @@ def _validate_by_source_lang(image_np, source_lang: str, target_lang: str, thres
                 source_all_text = "".join([t["text"] for t in source_texts])
                 source_letter_chars = sum(1 for c in source_all_text if c.isalpha())
                 logger.info(f"[OCR 보조검증] 타겟({target_lang}) 리더 0자(None) → 원본({source_lang}) 리더 {source_letter_chars}자")
-                if source_letter_chars >= 8:
+                _min_chars = 3 if scripts_are_distinct(source_lang, target_lang) else 8
+                if source_letter_chars >= _min_chars:
                     return _make_invalid_result(
                         f"원본 언어({source_lang}) 텍스트 잔존 감지 (원본 리더: {source_letter_chars}자, 타겟 리더: 0자)",
                         total_chars=source_letter_chars,
@@ -599,7 +600,8 @@ def _validate_by_source_lang(image_np, source_lang: str, target_lang: str, thres
                 source_all_text = "".join([t["text"] for t in source_texts])
                 source_letter_chars = sum(1 for c in source_all_text if c.isalpha())
                 logger.info(f"[OCR 보조검증] 타겟({target_lang}) 리더 {letter_chars}자 → 원본({source_lang}) 리더 {source_letter_chars}자")
-                if source_letter_chars >= 8:
+                _min_chars = 3 if scripts_are_distinct(source_lang, target_lang) else 8
+                if source_letter_chars >= _min_chars:
                     # 원본 리더는 텍스트를 많이 감지 → 미번역 이미지
                     return _make_invalid_result(
                         f"원본 언어({source_lang}) 텍스트 잔존 감지 (원본 리더: {source_letter_chars}자, 타겟 리더: {letter_chars}자)",
@@ -676,7 +678,7 @@ def _source_reader_cross_check(image_np, source_lang: str, target_lang: str, pre
             f"타겟 스크립트 {target_script_chars}자"
         )
 
-        MIN_SOURCE_CHARS = 8
+        MIN_SOURCE_CHARS = 3   # 이 함수는 scripts_are_distinct=True일 때만 호출됨
         MIN_SOURCE_RATIO = 0.10
         source_ratio = source_script_chars / source_letter_chars if source_letter_chars > 0 else 0.0
 
